@@ -636,7 +636,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/train/train_video2pose2rot.yaml",
+        default="configs/train_video2pose2rot_v2pv3.yaml",
         help="Path to the YAML config file",
     )
     args = parser.parse_args()

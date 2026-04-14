@@ -75,10 +75,18 @@ class Video2Pose2RotModel(nn.Module):
         # -------------------------
         # stage1: video2pos
         # -------------------------
-        pred_position = self.video2pos(
-            batch,
-            attention_kwargs=attention_kwargs,
-        )
+        if attention_kwargs is None:
+            pred_position = self.video2pos(batch)
+        else:
+            try:
+                pred_position = self.video2pos(
+                    batch,
+                    attention_kwargs=attention_kwargs,
+                )
+            except TypeError as e:
+                if "attention_kwargs" not in str(e):
+                    raise
+                pred_position = self.video2pos(batch)
 
         # -------------------------
         # choose pose source for stage2
