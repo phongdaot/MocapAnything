@@ -357,12 +357,21 @@ def train_video2pose2rot_v2pv3(cfg):
     else:
         device = torch.device("cpu")
 
-    attention_design = model_cfg["attention_kwargs"]
-    seq_len = attention_design["seq_len"]
+    # 保留原 attention_kwargs 作为 train 的模板；test 单独覆盖 seq_len
+    base_attention_design = model_cfg["attention_kwargs"]
+    train_seq_len = base_attention_design["seq_len"]
+    # 如果 eval 没传就默认和 train 一样
+    test_seq_len = eval_cfg.get("seq_len", train_seq_len)
+
+    train_attention_design = dict(base_attention_design)
+    train_attention_design["seq_len"] = train_seq_len
+
+    test_attention_design = dict(base_attention_design)
+    test_attention_design["seq_len"] = test_seq_len
 
     dataset_train = AnySpeciesPoseDataset(
         bvh_dir=data_cfg["bvh_dir"],
-        window=seq_len,
+        window=train_seq_len,
         mmap=data_cfg.get("mmap", True),
         cache_scale=data_cfg.get("cache_scale", True),
         limit_species_debug=data_cfg.get("limit_species_debug", []),
@@ -390,7 +399,7 @@ def train_video2pose2rot_v2pv3(cfg):
     _, test_loaders = build_test_dataloaders(
         data_cfg=data_cfg,
         eval_cfg=eval_cfg,
-        seq_len=seq_len,
+        seq_len=test_seq_len,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
@@ -431,6 +440,8 @@ def train_video2pose2rot_v2pv3(cfg):
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"总参数量: {total_params:,}")
         print(f"可训练参数量: {trainable_params:,}")
+        print(f"train seq_len: {train_seq_len}")
+        print(f"test seq_len: {test_seq_len}")
         print(f"pose_source_mode: {train_cfg['pose_input']['pose_source_mode']}")
         print(f"pose_mix_start_prob: {train_cfg['pose_input']['pose_mix_start_prob']}")
         print(f"pose_mix_end_prob: {train_cfg['pose_input']['pose_mix_end_prob']}")
@@ -511,7 +522,7 @@ def train_video2pose2rot_v2pv3(cfg):
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 model_out = model(
                     batch=batch,
-                    attention_kwargs=attention_design,
+                    attention_kwargs=train_attention_design,   # train 用训练长度
                     # pose_source_mode=args.pose_source_mode,
                     pose_source_mode="pred", # pred
                     pose_mix_prob=pose_pred_prob,
@@ -589,7 +600,7 @@ def train_video2pose2rot_v2pv3(cfg):
                     loader=loader,
                     model=model,
                     device=device,
-                    attention_design=attention_design,
+                    attention_design=test_attention_design,   # test 用测试长度
                     cfg=cfg,
                     pose_pred_prob=pose_pred_prob,
                     writer=writer,
