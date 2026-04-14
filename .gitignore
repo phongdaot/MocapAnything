@@ -73,41 +73,16 @@ mlruns/
 *.pkl
 *.pickle
 
-# Data files
-*.npy
-*.npz
-*.hdf5
-*.h5
-*.csv
-*.json
-*.parquet
-
-# Video / image data
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.bmp
-*.tiff
-
-# BVH / mesh output
-*.bvh
-*.obj
-*.fbx
-*.glb
-*.gltf
-*.ply
-
 # Logs
 *.log
 logs/
 output/
+outputs/
 results/
 
 # Config secrets / local overrides
 *.local.yaml
 *.local.yml
+
+# External git
+TripoSG/
