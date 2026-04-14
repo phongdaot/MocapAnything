@@ -1,0 +1,65 @@
+### inference_mesh2pose.yaml ###
+name: "Mesh2Pose temporal inference zoo exp1104"
+
+runtime:
+  device: "cuda"
+  seed: 42
+
+weights:
+  mesh2pose_ckpt_root: "./checkpoints/mesh2pose"
+  triposg_weights_dir: "./checkpoints/TripoSG_temporal"
+  rmbg_weights_dir: "./checkpoints/RMBG-1.4"
+
+model:
+
+  target: "models.v1.mesh2pose.model.RefGuidedMesh2PoseModel"
+
+  params:
+    q_dim: 256
+    num_layers: 12
+    num_heads: 8
+    ref_layers: 4
+    mesh_dim: 3
+    img_dim: 1024
+    num_joints: 150
+
+    use_graph_ref_outer: false
+    use_graph_ref_inner: true
+    use_graph_temporal_outer: false
+    use_graph_temporal_inner: true
+    use_joint_embed: true
+  
+  attention_kwargs:
+    seq_len: 24
+    selfatt_temporal_layer_flag: []
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 5
+    crossatt2_slidwindow: 5
+
+data:
+
+  retarget: 
+    toggle: true # if true, the predicted pose will be retargetted to GT skeleton before evaluation. Set to false if the predicted pose and GT pose already share the same skeleton structure.
+    ref_seq: "Eagle#Eagle-Landing/y0" # only when retargetting is true, e.g. "Dog-2#DOG-WalkNormal/y30", the reference sequence used for retargetting, should be in the format of "species-name#sequence-name"
+
+    # ref_seq: ""
+    
+    ref_idx: 0
+  
+  wild_flag: false # if true, no ground truth provided for inference, only reference frame is used as input, and the output will be saved in output folder without evaluation. If false, GT pose sequence will be provided as input, and the output will be evaluated against GT and saved in output folder.
+
+  base_dir: "./datasets/zoo"
+  image_roots:
+    - "./datasets/selected_nbg_zoo1010"
+
+  bvh_roots:
+    - "./datasets/zoo/bvh"
+
+  glb_root_dir: "./outputs/video2mesh/selected_nbg_zoo1010"
+
+output:
+  save_dir: "./outputs/mesh2pose/"
+
+experiment:
+  exp: "debug3"

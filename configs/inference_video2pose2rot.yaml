@@ -1,0 +1,91 @@
+
+### inference_video2pose2rot.yaml ###
+name: "Video to pose to rotation inference"
+
+runtime:
+  device: "cuda"
+  dtype: "float16"
+  seed: 42
+
+weights:
+  video2pose_ckpt_root: "./checkpoints/video2pose2rot"
+  triposg_weights_dir: "./checkpoints/TripoSG_temporal"
+  rmbg_weights_dir: "./checkpoints/RMBG-1.4"
+  ckpt_name: "video2pos2rot_ckpt_best.pt"
+
+experiment:
+  exp: "video2pos2rot_exp1_mixGT2Pred_detach_stage1stable"
+
+model:
+  target: models.v2.video2pose2rot.model.Video2Pose2RotModel
+  params:
+
+    v2p_cfg:
+      target: models.v2.video2pose.model.RefGuidedVideo2PoseModel
+      params:
+        q_dim: 256
+        num_layers: 12
+        num_heads: 8
+        ref_layers: 4
+        img_dim: 1024
+        num_joints: 150
+        use_graph_ref_outer: false
+        use_graph_ref_inner: true
+        use_graph_temporal_outer: false
+        use_graph_temporal_inner: true
+        use_joint_embed: true
+
+    p2r_cfg:
+      target: models.v2.pose2rot.model.Pose2RotMemoryRestModel
+      params: 
+        q_dim: 256
+        rest_layers: 4
+        pose_layers: 4
+        memory_layers: 4
+        decoder_layers: 10
+        num_heads: 8
+        joint_embed_dim: 768
+        temporal_window: 2
+        temporal_dropout: 0.1
+        decoder_cond_mode: add # add | concat
+        pose_rest_film: true
+        memory_rest_film: true
+        decoder_rest_film: true
+        pose_use_graph: true
+        use_grad_checkpoint: false
+        decoder_use_cross_layers: 6
+  
+  attention_kwargs:
+    seq_len: 24
+    selfatt_temporal_layer_flag: []
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 5
+    crossatt2_slidwindow: 5
+data:
+  base_dir: "./datasets/zoo1030"
+  character_dir: "./datasets/zoo1030/characters_fix_facezplus"
+  memory_pkl_path: "./datasets/zoo1030/cache/species_fps_memory_yAll/fps_select_by_rot_32.pkl"
+  scale_dict_path: "./datasets/zoo1030/cache/__mesh2pose1002_species_scale_cache.pkl"
+  bvh_roots:
+    - "./datasets/zoo1030/bvh"
+
+  image_roots:    
+    - "./datasets/selected_nbg_zoo1010"
+
+  retarget:
+    toggle: false # if true, the predicted pose will be retargetted to GT skeleton before evaluation. Set to false if the predicted pose and GT pose already share the same skeleton structure.
+    ref_seq: "Monkey#B02_idle/y0" # only when retargetting is true, e.g. "Dog-2#DOG-WalkNormal/y30", the reference sequence used for retargetting, should be in the format of "species-name#sequence-name"
+    # ref_seq: ""
+    ref_idx: 0
+  
+  wild_flag: false # if true, no ground truth provided for inference, only reference frame is used as input, and the output will be saved in output folder without evaluation. If false, GT pose sequence will be provided as input, and the output will be evaluated against GT and saved in output folder.
+
+  max_pts: 1024
+
+output:
+  blender_path: "./datasets/blender-3.6.14-linux-x64/blender"
+  save_dir: "./outputs/video2pose2rot"
+  fps: 15
+  export_gt_mesh: false
+  export_gt_video: false

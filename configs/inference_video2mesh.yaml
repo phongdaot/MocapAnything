@@ -1,0 +1,41 @@
+
+### inference_video2mesh.yaml ###
+name: "TripoSG inference"
+
+runtime:
+  device: "cuda"
+  dtype: "float16"
+  seed: 42
+
+weights:
+  triposg_weights_dir: "./checkpoints/TripoSG_temporal"
+  rmbg_weights_dir: "checkpoints/RMBG-1.4"
+  transformer_path: null
+
+model:
+  target: "models.v1.video2mesh.pipeline_triposg.TripoSGPipeline"
+  params:
+    num_inference_steps: 50
+    attention_kwargs:
+      seq_len: 36
+      selfatt_temporal_layer_flag: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+      selfatt_temporal: true
+      crossatt2_temporal: true
+      selfatt_slidwindow: 3
+      crossatt2_slidwindow: 5
+
+inference:
+  guidance_scale: 7.0
+  faces: -1
+  reverse: false
+
+paths:
+  base_data_path: "./datasets/video"
+  test_folder:
+    - "custom_video"
+  output_base: "outputs/video2mesh"
+
+preprocess:
+  no_imgprepare_crop: false
+  bg_color: [1.0, 1.0, 1.0]
+  max_images: 30

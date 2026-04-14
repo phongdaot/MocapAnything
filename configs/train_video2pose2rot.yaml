@@ -1,0 +1,116 @@
+
+### train_video2pose2rot.yaml ###
+name: Video2Pose2Rot training
+
+runtime:
+  device: cuda
+  seed: 42
+  debug: false
+
+output:
+  checkpoint_root: ./checkpoints/video2pose2rot
+
+experiment:
+  exp: video2pose2pose_3103
+
+model:
+  target: models.v2.video2pose2rot.model.Video2Pose2RotModel
+  params:
+
+    v2p_cfg:
+      target: models.v2.video2pose.model.RefGuidedVideo2PoseModel
+      params:
+        q_dim: 256
+        num_layers: 12
+        num_heads: 8
+        ref_layers: 4
+        img_dim: 1024
+        num_joints: 150
+        use_graph_ref_outer: false
+        use_graph_ref_inner: true
+        use_graph_temporal_outer: false
+        use_graph_temporal_inner: true
+        use_joint_embed: true
+
+    p2r_cfg:
+      target: models.v2.pose2rot.model.Pose2RotMemoryRestModel
+      params: 
+        q_dim: 256
+        rest_layers: 4
+        pose_layers: 4
+        memory_layers: 4
+        decoder_layers: 10
+        num_heads: 8
+        joint_embed_dim: 768
+        temporal_window: 2
+        temporal_dropout: 0.1
+        decoder_cond_mode: add # add | concat
+        pose_rest_film: true
+        memory_rest_film: true
+        decoder_rest_film: true
+        pose_use_graph: true
+        use_grad_checkpoint: false
+        decoder_use_cross_layers: 6
+    
+  attention_kwargs:
+    seq_len: 24
+    selfatt_temporal_layer_flag: []
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 5
+    crossatt2_slidwindow: 5
+
+train:
+  batch_size: 1
+  epochs: 500
+  grad_accum_steps: 4
+  lr: 0.0001
+  max_ckpt: 5
+  num_workers_train: 2
+  test_every: 1
+  pretrain_ckpt: null
+
+  pose_input:
+    pose_source_mode: "mix" # "gt" | "pred" | "mix"
+    pose_mix_start_prob: 0.1
+    pose_mix_end_prob: 0.8
+    pose_mix_warmup_epochs: 80
+    pose_mix_schedule: "linear" # "linear" | "cosine"
+    detach_pred_pose_for_rot: true
+
+  loss:
+    rot_loss_type: smooth_l1
+    vel_loss_type: smooth_l1
+    acc_loss_type: smooth_l1
+    pose_loss_type: l2
+    pose_vel_loss_type: l1
+  
+  weight:
+    root_wt: 0.1
+    fk_wt: 0.0
+    vel_wt: 1.0
+    acc_wt: 0.0
+    rot_wt: 1.0
+    pose_wt: 1.0
+    pose_vel_wt: 0.0
+
+  vis_every: 5
+  weight_decay: 0.0
+
+eval:
+  batch_size: 1
+  num_workers: 2
+  preload_all: false
+  split_groups: ["seen", "rare", "unseen"]
+  best_metric_split: "seen"
+  best_metric_name: "rot_l1"
+
+data:
+  seq_len: 24
+  bvh_dir: datasets/zoo1030/bvh
+  cache_scale: true
+  limit_species_debug: []
+  mmap: true
+  split_json: datasets/zoo1030/selected_test_split1010.json
+  train_memory_pkl_path: datasets/zoo1030/cache/species_fps_memory_yAll/fps_select_by_rot_32.pkl
+  test_memory_pkl_path: datasets/zoo1030/cache/species_fps_memory_yAll/fps_select_by_rot_32.pkl

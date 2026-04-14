@@ -1,0 +1,75 @@
+### train_mesh2pose.yaml ###
+name: "Mesh2Pose training"
+
+runtime:
+  device: "cuda"
+  seed: 42
+  debug: false
+
+output:
+  checkpoint_root: "./checkpoints/mesh2pose"
+
+experiment:
+  exp: "exp2403"
+
+model:
+  target: "models.v1.mesh2pose.model.RefGuidedMesh2PoseModel"
+
+  params:
+    q_dim: 256
+    num_layers: 12
+    num_heads: 8
+    ref_layers: 4
+    mesh_dim: 3
+    img_dim: 1024
+    num_joints: 150
+
+    use_graph_ref_outer: false
+    use_graph_ref_inner: true
+    use_graph_temporal_outer: false
+    use_graph_temporal_inner: true
+    use_joint_embed: true
+
+  attention_kwargs:
+    seq_len: 24
+    selfatt_temporal_layer_flag: []
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 5
+    crossatt2_slidwindow: 5
+
+data:
+  bvh_dir: "datasets/zoo1030/bvh"
+  bvh_roots:
+    - "datasets/zoo1030/bvh"
+  split_json: "datasets/zoo1030/selected_test_split1010.json"
+  mmap: true
+  cache_scale: true
+  limit_species_debug: []
+
+train:
+  epochs: 500
+  batch_size: 1
+  num_workers_train: 4
+
+  lr: 0.0001
+  weight_decay: 0.0
+  loss_type: "l2"
+
+  grad_accum_steps: 1
+  test_every: 1
+  vis_every: 5
+  max_ckpt: 5
+  pretrain_ckpt: null
+
+eval:
+  batch_size: 1
+  num_workers: 2
+
+  test_types:
+    gtmesh: null
+    predmesh: "./outputs/video2mesh_npz4test/selected_nbg_zoo1010_video2mesh1031exp1"
+    predmesh2: "./outputs/video2mesh_npz4test/selected_nbg_zoo1010_video2mesh1010bexp1"
+
+  best_metric_test_type: "gtmesh"
+  best_metric_name: "mpjpe"
