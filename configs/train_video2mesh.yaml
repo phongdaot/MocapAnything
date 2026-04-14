@@ -1,0 +1,88 @@
+### train_video2mesh.yaml ###
+# Training config for the video2mesh temporal DiT (TripoSG TripoSGDiTModel4D).
+#
+# This trainer expects the dataset to be preprocessed by
+# preprocess/preprocess_data.py, which writes per-sample .npz files under
+# <dataset_root>/npz_train/ containing:
+#     latent:      [T, 2048, 64]   (VAE-encoded mesh latent)
+#     image_embed: [T, 257, 1024]  (frozen DinoV2 image embedding)
+#
+# Only the transformer is trained (the VAE + image encoder are frozen and
+# already applied during preprocessing).
+
+name: "Video2Mesh training"
+
+runtime:
+  device: "cuda"
+  seed: 42
+  # AMP compute dtype. "bfloat16" is safer for DiT; "float16" is faster on older GPUs.
+  amp_dtype: "bfloat16"
+  debug: false
+
+output:
+  checkpoint_root: ./checkpoints/video2mesh
+
+experiment:
+  exp: video2mesh_base
+
+model:
+  target: models.v1.video2mesh.triposg_transformer.TripoSGDiTModel4D
+  params:
+    num_attention_heads: 16
+    width: 2048
+    in_channels: 64
+    num_layers: 21
+    cross_attention_dim: 1024
+    use_cross_attention_2: false
+    cross_attention_2_dim: null
+
+  attention_kwargs:
+    seq_len: 16
+    selfatt_temporal_layer_flag: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 3
+    crossatt2_slidwindow: 5
+
+train:
+  batch_size: 1
+  epochs: 200
+  grad_accum_steps: 4
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  max_grad_norm: 1.0
+  max_ckpt: 5
+  num_workers_train: 4
+  test_every: 1
+  pretrain_ckpt: null             # optional: load transformer weights partially
+  use_grad_checkpoint: true       # TripoSG DiT is large; enable by default
+  find_unused_parameters: false
+
+  loss:
+    # Flow-matching loss on transformer output vs. (noise - data).
+    loss_type: "l2"               # l1 | l2 | smooth_l1
+    # Sampling strategy for the flow-matching time parameter u in (0, 1).
+    t_schedule: "logit_normal"    # uniform | logit_normal
+    t_mean: 0.0                   # only used for logit_normal
+    t_std: 1.0                    # only used for logit_normal
+    # Scales u -> model timestep. TripoSG DiT uses positional embeddings on
+    # the [0, 1000] range, matching its inference scheduler.
+    timestep_scale: 1000.0
+
+eval:
+  batch_size: 1
+  num_workers: 2
+  best_metric_name: "fm_loss"
+
+data:
+  # Directory containing the preprocessed .npz training files.
+  npz_dir: datasets/zoo1030/npz_train
+  # Optional split JSON with {"train": [...], "test": [...]} of sample ids
+  # (relative path without .npz). If null, everything is used for training
+  # and evaluation is skipped.
+  split_json: null
+  # Skip any sample whose underlying clip has fewer than this many frames.
+  min_frames: null
+  preload_all: false
+  debug_limit: null
