@@ -1,0 +1,113 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.eggs/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# PyCharm / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML / training artifacts
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.pkl
+*.pickle
+
+# Data files
+*.npy
+*.npz
+*.hdf5
+*.h5
+*.csv
+*.json
+*.parquet
+
+# Video / image data
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+# BVH / mesh output
+*.bvh
+*.obj
+*.fbx
+*.glb
+*.gltf
+*.ply
+
+# Logs
+*.log
+logs/
+output/
+results/
+
+# Config secrets / local overrides
+*.local.yaml
+*.local.yml
