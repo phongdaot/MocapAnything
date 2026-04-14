@@ -43,7 +43,7 @@ model:
         joint_embed_dim: 768
         temporal_window: 2
         temporal_dropout: 0.1
-        decoder_cond_mode: add # add | concat
+        decoder_cond_mode: add
         pose_rest_film: true
         memory_rest_film: true
         decoder_rest_film: true

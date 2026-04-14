@@ -1,5 +1,6 @@
 import torch.nn as nn
 import torch
+import inspect
 from typing import Optional, Dict, Any, Tuple
 from utils.config_utils import instantiate_from_config
 
@@ -58,6 +59,9 @@ class Video2Pose2RotModel(nn.Module):
 
         # stage1: video -> pose
         self.video2pos = instantiate_from_config(v2p_cfg)
+        self.video2pos_accepts_attention_kwargs = (
+            "attention_kwargs" in inspect.signature(self.video2pos.forward).parameters
+        )
 
         # stage2: pose -> rot
         self.pos2rot = instantiate_from_config(p2r_cfg)
@@ -75,18 +79,13 @@ class Video2Pose2RotModel(nn.Module):
         # -------------------------
         # stage1: video2pos
         # -------------------------
-        if attention_kwargs is None:
+        if attention_kwargs is None or not self.video2pos_accepts_attention_kwargs:
             pred_position = self.video2pos(batch)
         else:
-            try:
-                pred_position = self.video2pos(
-                    batch,
-                    attention_kwargs=attention_kwargs,
-                )
-            except TypeError as e:
-                if "attention_kwargs" not in str(e):
-                    raise
-                pred_position = self.video2pos(batch)
+            pred_position = self.video2pos(
+                batch,
+                attention_kwargs=attention_kwargs,
+            )
 
         # -------------------------
         # choose pose source for stage2
