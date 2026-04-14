@@ -1,7 +1,12 @@
 
 ### video2pose2rot_v2pv3.py ###
-from train.pose2rot import PROCESS_NAME
-from utils.dist_utils import setup_distributed, is_main_process, cleanup_distributed
+from utils.dist_utils import (
+    setup_distributed,
+    is_main_process,
+    cleanup_distributed,
+    worker_init_fn,
+    reduce_sum_scalar,
+)
 import os
 import sys
 import time
@@ -19,14 +24,14 @@ from data.loader_v2 import AnySpeciesPoseDataset, collate_anyspecies_padded
 from utils.config_utils import instantiate_from_config
 from utils.common import set_seed
 from utils.rotation import bvh_forward, rot6d_to_fk_positions, rot6d_to_rotmat_tensor
-from utils.dist_utils import *
 from utils.loss import *
 from utils.npy2bvh import convert_npy_to_bvh
 from utils.train_utils import *
 from utils.config_utils import load_yaml_config, dump_yaml_config
+from utils.logger import logger
 import argparse
 torch.multiprocessing.set_start_method("spawn", force=True)
-from .video2pose_v3 import build_test_dataloaders
+from train.video2pose_v3 import build_test_dataloaders
 import math
 
 PROCESS_NAME = "video2pose2rot_v2pv3"
@@ -176,7 +181,7 @@ def visualize_joint_sample(
     gt_rot,
 ):
     """
-    一个 sample 输出四类结果：
+    Save four outputs for one sample:
         pos_pred / pos_gt
         rot_pred / rot_gt (-> bvh)
     """
@@ -236,16 +241,16 @@ def run_evaluation(
     vis_done_species = set()
     max_vis_species = 50
 
-    vis_save_dir = os.path.join(base_dir, f"vis_video2pose2rot_v2pv3_epoch{epoch}")
+    vis_save_dir = os.path.join(base_dir, f"vis_video2pose2rot_epoch{epoch}")
     if is_main_process() and (epoch + 1) % cfg["train"]["vis_every"] == 0:
         os.makedirs(vis_save_dir, exist_ok=True)
 
     with torch.no_grad():
-
-        cnt = 0
+        
+        debug_batch_count = 0
         for batch in tqdm_loader:
-            cnt += 1
-            if cfg["runtime"]["debug"] and cnt >= 10: break
+            debug_batch_count += 1
+            if cfg["runtime"]["debug"] and debug_batch_count >= 10: break
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
@@ -265,7 +270,7 @@ def run_evaluation(
             for k in metric_sums:
                 metric_sums[k] += float(metrics[k]) * bs
 
-
+            
             if is_main_process() and (epoch + 1) % cfg["train"]["vis_every"] == 0:
                 species_list = batch["species"]
                 for si, species_name in enumerate(species_list):
@@ -296,11 +301,11 @@ def run_evaluation(
                         print(f"[VIS] failed on {species_name}: {e}")
 
     sample_count = reduce_sum_scalar(sample_count, device)
-
+    
     for k in metric_sums:
         metric_sums[k] = reduce_sum_scalar(metric_sums[k], device) / max(sample_count, 1)
-
-
+            
+    
     if is_main_process():
         print(
             f"[Eval] "
@@ -335,17 +340,17 @@ def train_video2pose2rot_v2pv3(cfg):
     train_cfg = cfg["train"]
     eval_cfg = cfg["eval"]
     output_cfg = cfg["output"]
-
+    
     set_seed(runtime_cfg.get("seed", 42))
 
     base_dir = os.path.join(output_cfg["checkpoint_root"], exp_cfg["exp"])
     os.makedirs(base_dir, exist_ok=True)
-
+    
     # Copy config to checkpoint dir for record
     if is_main_process():
         config_save_path = os.path.join(base_dir, "config.yaml")
         dump_yaml_config(cfg, config_save_path)
-
+    
     logdir = os.path.join(base_dir, "logs_video2pose2rot_v2pv3")
 
     if is_main_process():
@@ -356,22 +361,12 @@ def train_video2pose2rot_v2pv3(cfg):
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cpu")
-
-    # 保留原 attention_kwargs 作为 train 的模板；test 单独覆盖 seq_len
-    base_attention_design = model_cfg["attention_kwargs"]
-    train_seq_len = base_attention_design["seq_len"]
-    # 如果 eval 没传就默认和 train 一样
-    test_seq_len = eval_cfg.get("seq_len", train_seq_len)
-
-    train_attention_design = dict(base_attention_design)
-    train_attention_design["seq_len"] = train_seq_len
-
-    test_attention_design = dict(base_attention_design)
-    test_attention_design["seq_len"] = test_seq_len
+        
+    attention_design = model_cfg["attention_kwargs"]
 
     dataset_train = AnySpeciesPoseDataset(
         bvh_dir=data_cfg["bvh_dir"],
-        window=train_seq_len,
+        window=attention_design["seq_len"],
         mmap=data_cfg.get("mmap", True),
         cache_scale=data_cfg.get("cache_scale", True),
         limit_species_debug=data_cfg.get("limit_species_debug", []),
@@ -399,12 +394,12 @@ def train_video2pose2rot_v2pv3(cfg):
     _, test_loaders = build_test_dataloaders(
         data_cfg=data_cfg,
         eval_cfg=eval_cfg,
-        seq_len=test_seq_len,
+        attention_design=attention_design,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
     )
-
+    
     model: torch.nn.Module = instantiate_from_config(model_cfg)
     model = model.to(device)
 
@@ -415,7 +410,7 @@ def train_video2pose2rot_v2pv3(cfg):
             output_device=local_rank,
             find_unused_parameters=True,
         )
-
+    
     lr = train_cfg["lr"]
     weight_decay = train_cfg.get("weight_decay", 0.0)
 
@@ -423,7 +418,7 @@ def train_video2pose2rot_v2pv3(cfg):
         optimizer = optim.Adam(model.parameters(), lr=lr)
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-
+        
     pose_fn = get_loss_fn(train_cfg["loss"].get("pose_loss_type", "smooth_l1"))
     pose_vel_fn = get_loss_fn(train_cfg["loss"].get("pose_vel_loss_type", "smooth_l1"))
     rot_fn = get_loss_fn(train_cfg["loss"].get("rot_loss_type", "smooth_l1"))
@@ -438,10 +433,8 @@ def train_video2pose2rot_v2pv3(cfg):
         print("=" * 100)
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"总参数量: {total_params:,}")
-        print(f"可训练参数量: {trainable_params:,}")
-        print(f"train seq_len: {train_seq_len}")
-        print(f"test seq_len: {test_seq_len}")
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
         print(f"pose_source_mode: {train_cfg['pose_input']['pose_source_mode']}")
         print(f"pose_mix_start_prob: {train_cfg['pose_input']['pose_mix_start_prob']}")
         print(f"pose_mix_end_prob: {train_cfg['pose_input']['pose_mix_end_prob']}")
@@ -475,9 +468,9 @@ def train_video2pose2rot_v2pv3(cfg):
     global_step = 0
     epochs = train_cfg["epochs"]
     grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
-
+    
     split_groups = eval_cfg.get("split_groups", ["seen", "rare", "unseen"])
-
+    
     for epoch in range(start_epoch, epochs):
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -509,10 +502,10 @@ def train_video2pose2rot_v2pv3(cfg):
         batch_times = []
         optimizer.zero_grad(set_to_none=True)
 
-        cnt = 0
+        debug_batch_count = 0
         for i, batch in loader_tqdm:
-            cnt += 1
-            if cfg["runtime"]["debug"] and cnt >= 10: break
+            debug_batch_count += 1
+            if cfg["runtime"]["debug"] and debug_batch_count >= 10: break
             batch_start_time = time.time()
 
             for k, v in batch.items():
@@ -522,9 +515,8 @@ def train_video2pose2rot_v2pv3(cfg):
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 model_out = model(
                     batch=batch,
-                    attention_kwargs=train_attention_design,   # train 用训练长度
-                    # pose_source_mode=args.pose_source_mode,
-                    pose_source_mode="pred", # pred
+                    attention_kwargs=attention_design,
+                    pose_source_mode="pred",
                     pose_mix_prob=pose_pred_prob,
                     detach_pred_pose_for_rot=train_cfg["pose_input"]["detach_pred_pose_for_rot"],
                 )
@@ -586,7 +578,7 @@ def train_video2pose2rot_v2pv3(cfg):
         epoch_time = time.time() - epoch_start_time
 
         if is_main_process():
-            print(f"Epoch {epoch + 1}: train total loss={train_loss:.6f} | 用时 {epoch_time:.1f}s")
+            print(f"Epoch {epoch + 1}: train total loss={train_loss:.6f} | time {epoch_time:.1f}s")
         if writer is not None:
             writer.add_scalar("epoch/train_total_loss", train_loss, epoch + 1)
             writer.add_scalar("epoch/pose_pred_prob", pose_pred_prob, epoch + 1)
@@ -600,7 +592,7 @@ def train_video2pose2rot_v2pv3(cfg):
                     loader=loader,
                     model=model,
                     device=device,
-                    attention_design=test_attention_design,   # test 用测试长度
+                    attention_design=attention_design,
                     cfg=cfg,
                     pose_pred_prob=pose_pred_prob,
                     writer=writer,
@@ -640,11 +632,11 @@ def train_video2pose2rot_v2pv3(cfg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Training script for Video2Pose2Rot (v2p v3)")
+    parser = argparse.ArgumentParser(description="Training script for Video2Pose2Rot v2pv3")
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/train/train_video2pose2rot_v2pv3.yaml",
+        default="configs/train_video2pose2rot_v2pv3.yaml",
         help="Path to the YAML config file",
     )
     args = parser.parse_args()
