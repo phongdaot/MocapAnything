@@ -1,6 +1,5 @@
 
-### video2pose2rot.py ###
-from train.pose2rot import PROCESS_NAME
+### video2pose2rot_v2pv3.py ###
 from utils.dist_utils import setup_distributed, is_main_process, cleanup_distributed
 import os
 import sys
@@ -511,8 +510,7 @@ def train_video2pose2rot_v2pv3(cfg):
                 model_out = model(
                     batch=batch,
                     attention_kwargs=attention_design,
-                    # pose_source_mode=args.pose_source_mode,
-                    pose_source_mode="pred", # pred
+                    pose_source_mode="pred",
                     pose_mix_prob=pose_pred_prob,
                     detach_pred_pose_for_rot=train_cfg["pose_input"]["detach_pred_pose_for_rot"],
                 )
