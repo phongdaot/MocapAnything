@@ -17,7 +17,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from data.loader_v2 import AnySpeciesPoseDataset, collate_anyspecies_padded
@@ -31,7 +31,6 @@ from utils.config_utils import load_yaml_config, dump_yaml_config
 from utils.logger import logger
 import argparse
 torch.multiprocessing.set_start_method("spawn", force=True)
-from train.video2pose_v3 import build_test_dataloaders
 import math
 
 PROCESS_NAME = "video2pose2rot_v2pv3"
@@ -198,6 +197,122 @@ def visualize_joint_sample(
     convert_npy_to_bvh(rot_pred_path, species_name)
     convert_npy_to_bvh(rot_gt_path, species_name)
 
+
+# =========================================================
+# multi-dataset builders
+# =========================================================
+def _normalize_dataset_cfgs(data_cfg):
+    """
+    Accept both legacy single-dataset data config (with bvh_dir/split_json at top level)
+    and the new list form (data.datasets: [...]). Returns a list of per-dataset dicts.
+    """
+    if "datasets" in data_cfg and data_cfg["datasets"]:
+        return list(data_cfg["datasets"])
+
+    # Legacy single-dataset fallback
+    legacy = {
+        "name": data_cfg.get("name", "default"),
+        "bvh_dir": data_cfg["bvh_dir"],
+        "split_json": data_cfg["split_json"],
+        "train_memory_pkl_path": data_cfg.get("train_memory_pkl_path"),
+        "test_memory_pkl_path": data_cfg.get("test_memory_pkl_path"),
+        "test_splits": data_cfg.get("test_splits", ["seen", "rare", "unseen"]),
+    }
+    return [legacy]
+
+
+def build_train_dataset(data_cfg, attention_design):
+    """Build a ConcatDataset from all training datasets in the list."""
+    dataset_cfgs = _normalize_dataset_cfgs(data_cfg)
+
+    train_datasets = []
+    for ds_cfg in dataset_cfgs:
+        ds = AnySpeciesPoseDataset(
+            bvh_dir=ds_cfg["bvh_dir"],
+            window=attention_design["seq_len"],
+            mmap=data_cfg.get("mmap", True),
+            cache_scale=data_cfg.get("cache_scale", True),
+            limit_species_debug=data_cfg.get("limit_species_debug", []),
+            split_json=ds_cfg["split_json"],
+            split_mode="train",
+            memory_pkl_path=ds_cfg.get("train_memory_pkl_path"),
+            preload_all=data_cfg.get("preload_all", False),
+        )
+        if is_main_process():
+            logger.info(
+                f"[train-data] dataset={ds_cfg['name']} "
+                f"bvh_dir={ds_cfg['bvh_dir']} size={len(ds)}"
+            )
+        train_datasets.append(ds)
+
+    if len(train_datasets) == 1:
+        return train_datasets[0]
+    return ConcatDataset(train_datasets)
+
+
+def build_test_dataloaders_multi(
+    data_cfg,
+    eval_cfg,
+    attention_design,
+    distributed,
+    rank,
+    world_size,
+):
+    """
+    Build per-dataset, per-split test loaders.
+    Returns:
+        test_loaders: {dataset_name: {split: DataLoader}}
+    """
+    dataset_cfgs = _normalize_dataset_cfgs(data_cfg)
+    default_splits = eval_cfg.get("split_groups", ["seen", "rare", "unseen"])
+
+    test_loaders = {}
+
+    for ds_cfg in dataset_cfgs:
+        name = ds_cfg["name"]
+        splits = ds_cfg.get("test_splits", default_splits)
+        test_loaders[name] = {}
+
+        for split in splits:
+            ds = AnySpeciesPoseDataset(
+                bvh_dir=ds_cfg["bvh_dir"],
+                window=attention_design["seq_len"],
+                mmap=data_cfg.get("mmap", True),
+                cache_scale=data_cfg.get("cache_scale", True),
+                limit_species_debug=data_cfg.get("limit_species_debug", []),
+                split_json=ds_cfg["split_json"],
+                split_mode="test",
+                split_group=split,
+                memory_pkl_path=ds_cfg.get("test_memory_pkl_path"),
+                preload_all=eval_cfg.get("preload_all", False),
+            )
+
+            sampler = (
+                DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
+                if distributed else None
+            )
+
+            loader = DataLoader(
+                ds,
+                batch_size=eval_cfg.get("batch_size", 1),
+                sampler=sampler,
+                shuffle=False,
+                num_workers=eval_cfg.get("num_workers", 2),
+                collate_fn=collate_anyspecies_padded,
+                worker_init_fn=worker_init_fn,
+            )
+
+            if is_main_process():
+                logger.info(
+                    f"[test-data] dataset={name} split={split} "
+                    f"bvh_dir={ds_cfg['bvh_dir']} size={len(ds)}"
+                )
+
+            test_loaders[name][split] = loader
+
+    return test_loaders
+
+
 # =========================================================
 # eval
 # =========================================================
@@ -241,12 +356,12 @@ def run_evaluation(
     vis_done_species = set()
     max_vis_species = 50
 
-    vis_save_dir = os.path.join(base_dir, f"vis_video2pose2rot_epoch{epoch}")
+    vis_save_dir = os.path.join(base_dir, f"vis_video2pose2rot_epoch{epoch}", tag_prefix)
     if is_main_process() and (epoch + 1) % cfg["train"]["vis_every"] == 0:
         os.makedirs(vis_save_dir, exist_ok=True)
 
     with torch.no_grad():
-        
+
         debug_batch_count = 0
         for batch in tqdm_loader:
             debug_batch_count += 1
@@ -270,7 +385,7 @@ def run_evaluation(
             for k in metric_sums:
                 metric_sums[k] += float(metrics[k]) * bs
 
-            
+
             if is_main_process() and (epoch + 1) % cfg["train"]["vis_every"] == 0:
                 species_list = batch["species"]
                 for si, species_name in enumerate(species_list):
@@ -301,14 +416,14 @@ def run_evaluation(
                         print(f"[VIS] failed on {species_name}: {e}")
 
     sample_count = reduce_sum_scalar(sample_count, device)
-    
+
     for k in metric_sums:
         metric_sums[k] = reduce_sum_scalar(metric_sums[k], device) / max(sample_count, 1)
-            
-    
+
+
     if is_main_process():
         print(
-            f"[Eval] "
+            f"[{tag_prefix}] "
             f"pose_l1={metric_sums['pose_l1']:.6f}, "
             f"pose_l2={metric_sums['pose_l2']:.6f}, "
             f"pose_mpjpe={metric_sums['pose_mpjpe']:.6f}, "
@@ -340,17 +455,17 @@ def train_video2pose2rot_v2pv3(cfg):
     train_cfg = cfg["train"]
     eval_cfg = cfg["eval"]
     output_cfg = cfg["output"]
-    
+
     set_seed(runtime_cfg.get("seed", 42))
 
     base_dir = os.path.join(output_cfg["checkpoint_root"], exp_cfg["exp"])
     os.makedirs(base_dir, exist_ok=True)
-    
+
     # Copy config to checkpoint dir for record
     if is_main_process():
         config_save_path = os.path.join(base_dir, "config.yaml")
         dump_yaml_config(cfg, config_save_path)
-    
+
     logdir = os.path.join(base_dir, "logs_video2pose2rot_v2pv3")
 
     if is_main_process():
@@ -361,20 +476,11 @@ def train_video2pose2rot_v2pv3(cfg):
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cpu")
-        
+
     attention_design = model_cfg["attention_kwargs"]
 
-    dataset_train = AnySpeciesPoseDataset(
-        bvh_dir=data_cfg["bvh_dir"],
-        window=attention_design["seq_len"],
-        mmap=data_cfg.get("mmap", True),
-        cache_scale=data_cfg.get("cache_scale", True),
-        limit_species_debug=data_cfg.get("limit_species_debug", []),
-        split_json=data_cfg["split_json"],
-        split_mode="train",
-        memory_pkl_path=data_cfg["train_memory_pkl_path"],
-        preload_all=data_cfg.get("preload_all", False)
-    )
+    # ---- train data: ConcatDataset across all datasets in the list ----
+    dataset_train = build_train_dataset(data_cfg, attention_design)
 
     sampler_train = (
         DistributedSampler(dataset_train, num_replicas=world_size, rank=rank, shuffle=True)
@@ -391,7 +497,8 @@ def train_video2pose2rot_v2pv3(cfg):
         worker_init_fn=worker_init_fn,
     )
 
-    _, test_loaders = build_test_dataloaders(
+    # ---- test loaders: {dataset_name: {split: loader}} ----
+    test_loaders = build_test_dataloaders_multi(
         data_cfg=data_cfg,
         eval_cfg=eval_cfg,
         attention_design=attention_design,
@@ -399,7 +506,7 @@ def train_video2pose2rot_v2pv3(cfg):
         rank=rank,
         world_size=world_size,
     )
-    
+
     model: torch.nn.Module = instantiate_from_config(model_cfg)
     model = model.to(device)
 
@@ -410,7 +517,7 @@ def train_video2pose2rot_v2pv3(cfg):
             output_device=local_rank,
             find_unused_parameters=True,
         )
-    
+
     lr = train_cfg["lr"]
     weight_decay = train_cfg.get("weight_decay", 0.0)
 
@@ -418,7 +525,7 @@ def train_video2pose2rot_v2pv3(cfg):
         optimizer = optim.Adam(model.parameters(), lr=lr)
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        
+
     pose_fn = get_loss_fn(train_cfg["loss"].get("pose_loss_type", "smooth_l1"))
     pose_vel_fn = get_loss_fn(train_cfg["loss"].get("pose_vel_loss_type", "smooth_l1"))
     rot_fn = get_loss_fn(train_cfg["loss"].get("rot_loss_type", "smooth_l1"))
@@ -468,9 +575,18 @@ def train_video2pose2rot_v2pv3(cfg):
     global_step = 0
     epochs = train_cfg["epochs"]
     grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
-    
-    split_groups = eval_cfg.get("split_groups", ["seen", "rare", "unseen"])
-    
+
+    # Pick which (dataset, split, metric) drives best-checkpoint selection.
+    # Falls back to the first dataset's first split if not explicitly set.
+    dataset_cfgs = _normalize_dataset_cfgs(data_cfg)
+    default_best_dataset = dataset_cfgs[0]["name"]
+    default_best_split = (
+        dataset_cfgs[0].get("test_splits") or eval_cfg.get("split_groups", ["seen"])
+    )[0]
+    best_metric_dataset = eval_cfg.get("best_metric_dataset", default_best_dataset)
+    best_metric_split = eval_cfg.get("best_metric_split", default_best_split)
+    best_metric_name = eval_cfg.get("best_metric_name", "rot_l1")
+
     for epoch in range(start_epoch, epochs):
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -584,23 +700,26 @@ def train_video2pose2rot_v2pv3(cfg):
             writer.add_scalar("epoch/pose_pred_prob", pose_pred_prob, epoch + 1)
 
         if (epoch + 1) % train_cfg["test_every"] == 0 or (epoch + 1) == train_cfg["epochs"]:
-            split_metrics = {}
-            for split in split_groups:
-                loader = test_loaders[split]
-                tag_prefix = f"test_{split}"
-                metrics = run_evaluation(
-                    loader=loader,
-                    model=model,
-                    device=device,
-                    attention_design=attention_design,
-                    cfg=cfg,
-                    pose_pred_prob=pose_pred_prob,
-                    writer=writer,
-                    epoch=epoch + 1,
-                    tag_prefix=tag_prefix,
-                    base_dir=base_dir,
-                )
-                split_metrics[split] = metrics
+            # Evaluate on every (dataset, split) pair.
+            # Result shape: {dataset_name: {split: metrics_dict}}
+            all_metrics = {}
+            for ds_name, split_loader_dict in test_loaders.items():
+                all_metrics[ds_name] = {}
+                for split, loader in split_loader_dict.items():
+                    tag_prefix = f"test_{ds_name}_{split}"
+                    metrics = run_evaluation(
+                        loader=loader,
+                        model=model,
+                        device=device,
+                        attention_design=attention_design,
+                        cfg=cfg,
+                        pose_pred_prob=pose_pred_prob,
+                        writer=writer,
+                        epoch=epoch + 1,
+                        tag_prefix=tag_prefix,
+                        base_dir=base_dir,
+                    )
+                    all_metrics[ds_name][split] = metrics
 
             if is_main_process():
                 save_checkpoint_with_epoch(
@@ -612,19 +731,32 @@ def train_video2pose2rot_v2pv3(cfg):
                 )
                 cleanup_old_checkpoints(base_dir, PROCESS_NAME, train_cfg.get("max_ckpt", 100))
 
-                best_metric_split = eval_cfg.get("best_metric_split", "seen")
-                best_metric_name = eval_cfg.get("best_metric_name", "rot_l1")
-                score = split_metrics[best_metric_split][best_metric_name]
-                if score < best_test_loss:
-                    best_test_loss = score
-                    torch.save({
-                        "model_state": (model.module if distributed else model).state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "epoch": epoch + 1,
-                        "best_test_loss": best_test_loss,
-                        "split_metrics": split_metrics,
-                    }, best_ckpt_path)
-                    print(f"New best checkpoint saved: {best_ckpt_path} ({best_metric_split}/{best_metric_name}={best_test_loss:.6f})")
+                if (
+                    best_metric_dataset in all_metrics
+                    and best_metric_split in all_metrics[best_metric_dataset]
+                    and best_metric_name in all_metrics[best_metric_dataset][best_metric_split]
+                ):
+                    score = all_metrics[best_metric_dataset][best_metric_split][best_metric_name]
+                    if score < best_test_loss:
+                        best_test_loss = score
+                        torch.save({
+                            "model_state": (model.module if distributed else model).state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "epoch": epoch + 1,
+                            "best_test_loss": best_test_loss,
+                            "all_metrics": all_metrics,
+                        }, best_ckpt_path)
+                        print(
+                            f"New best checkpoint saved: {best_ckpt_path} "
+                            f"({best_metric_dataset}/{best_metric_split}/{best_metric_name}"
+                            f"={best_test_loss:.6f})"
+                        )
+                else:
+                    logger.warning(
+                        f"best_metric tuple "
+                        f"({best_metric_dataset}/{best_metric_split}/{best_metric_name}) "
+                        f"not found in eval results; skipping best-ckpt update."
+                    )
 
     if writer is not None:
         writer.close()

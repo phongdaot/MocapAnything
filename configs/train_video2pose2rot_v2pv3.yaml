@@ -100,16 +100,33 @@ eval:
   batch_size: 1
   num_workers: 2
   preload_all: false
+  # Default splits used when a dataset entry below doesn't list `test_splits`.
   split_groups: ["seen", "rare", "unseen"]
+  # Best-checkpoint selector is now a (dataset, split, metric) tuple.
+  best_metric_dataset: "zoo1030"
   best_metric_split: "seen"
   best_metric_name: "rot_l1"
 
 data:
+  # shared across all datasets
   seq_len: 24
-  bvh_dir: datasets/zoo1030/bvh
   cache_scale: true
   limit_species_debug: []
   mmap: true
-  split_json: datasets/zoo1030/selected_test_split1010.json
-  train_memory_pkl_path: datasets/zoo1030/cache/species_fps_memory_yAll/fps_select_by_rot_32.pkl
-  test_memory_pkl_path: datasets/zoo1030/cache/species_fps_memory_yAll/fps_select_by_rot_32.pkl
+
+  # List of datasets. They are concatenated for training, and each one is
+  # evaluated independently on its own `test_splits`.
+  datasets:
+    - name: zoo1030
+      bvh_dir: datasets/zoo1030/bvh
+      split_json: datasets/zoo1030/selected_test_split1010.json
+      train_memory_pkl_path: datasets/zoo1030/cache/species_fps_memory_yAll/fps_select_by_rot_32.pkl
+      test_memory_pkl_path: datasets/zoo1030/cache/species_fps_memory_yAll/fps_select_by_rot_32.pkl
+      test_splits: ["seen", "rare", "unseen"]
+
+    - name: obj1k
+      bvh_dir: datasets/obj1k/bvh
+      split_json: datasets/obj1k/select_test_obj1k.json
+      train_memory_pkl_path: null
+      test_memory_pkl_path: null
+      test_splits: ["seen"]
