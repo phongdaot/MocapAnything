@@ -1,6 +1,12 @@
 
 ### video2pose2rot_v2pv3.py ###
-from utils.dist_utils import setup_distributed, is_main_process, cleanup_distributed
+from utils.dist_utils import (
+    setup_distributed,
+    is_main_process,
+    cleanup_distributed,
+    worker_init_fn,
+    reduce_sum_scalar,
+)
 import os
 import sys
 import time
@@ -18,14 +24,14 @@ from data.loader_v2 import AnySpeciesPoseDataset, collate_anyspecies_padded
 from utils.config_utils import instantiate_from_config
 from utils.common import set_seed
 from utils.rotation import bvh_forward, rot6d_to_fk_positions, rot6d_to_rotmat_tensor
-from utils.dist_utils import *
 from utils.loss import *
 from utils.npy2bvh import convert_npy_to_bvh
 from utils.train_utils import *
 from utils.config_utils import load_yaml_config, dump_yaml_config
+from utils.logger import logger
 import argparse
 torch.multiprocessing.set_start_method("spawn", force=True)
-from .video2pose_v3 import build_test_dataloaders
+from train.video2pose_v3 import build_test_dataloaders
 import math
 
 PROCESS_NAME = "video2pose2rot_v2pv3"
@@ -175,7 +181,7 @@ def visualize_joint_sample(
     gt_rot,
 ):
     """
-    一个 sample 输出四类结果：
+    Save four outputs for one sample:
         pos_pred / pos_gt
         rot_pred / rot_gt (-> bvh)
     """
@@ -241,10 +247,10 @@ def run_evaluation(
 
     with torch.no_grad():
         
-        cnt = 0
+        debug_batch_count = 0
         for batch in tqdm_loader:
-            cnt += 1
-            if cfg["runtime"]["debug"] and cnt >= 10: break
+            debug_batch_count += 1
+            if cfg["runtime"]["debug"] and debug_batch_count >= 10: break
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
@@ -427,8 +433,8 @@ def train_video2pose2rot_v2pv3(cfg):
         print("=" * 100)
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"总参数量: {total_params:,}")
-        print(f"可训练参数量: {trainable_params:,}")
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
         print(f"pose_source_mode: {train_cfg['pose_input']['pose_source_mode']}")
         print(f"pose_mix_start_prob: {train_cfg['pose_input']['pose_mix_start_prob']}")
         print(f"pose_mix_end_prob: {train_cfg['pose_input']['pose_mix_end_prob']}")
@@ -496,10 +502,10 @@ def train_video2pose2rot_v2pv3(cfg):
         batch_times = []
         optimizer.zero_grad(set_to_none=True)
 
-        cnt = 0
+        debug_batch_count = 0
         for i, batch in loader_tqdm:
-            cnt += 1
-            if cfg["runtime"]["debug"] and cnt >= 10: break
+            debug_batch_count += 1
+            if cfg["runtime"]["debug"] and debug_batch_count >= 10: break
             batch_start_time = time.time()
 
             for k, v in batch.items():
@@ -572,7 +578,7 @@ def train_video2pose2rot_v2pv3(cfg):
         epoch_time = time.time() - epoch_start_time
 
         if is_main_process():
-            print(f"Epoch {epoch + 1}: train total loss={train_loss:.6f} | 用时 {epoch_time:.1f}s")
+            print(f"Epoch {epoch + 1}: train total loss={train_loss:.6f} | time {epoch_time:.1f}s")
         if writer is not None:
             writer.add_scalar("epoch/train_total_loss", train_loss, epoch + 1)
             writer.add_scalar("epoch/pose_pred_prob", pose_pred_prob, epoch + 1)
