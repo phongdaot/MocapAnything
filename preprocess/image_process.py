@@ -148,4 +148,68 @@ def prepare_image(image_path, bg_color, rmbg_net=None):
         img_pil = Image.fromarray((img_np*255).astype(np.uint8))
         
         return img_pil
+
+
+def pad_to_square(img_path, pad_color=(255, 255, 255)):
     
+    if os.path.isfile(img_path):
+        img = Image.open(img_path)
+        w, h = img.size
+        if w == h:
+            return img, False
+
+        side = max(w, h)
+
+        if img.mode in ("RGBA", "LA"):
+            background = (pad_color[0], pad_color[1], pad_color[2], 255) if len(pad_color) == 3 else pad_color
+            canvas = Image.new(img.mode, (side, side), background)
+        else:
+            canvas = Image.new(img.mode, (side, side), pad_color)
+
+        x = (side - w) // 2
+        y = (side - h) // 2
+        canvas.paste(img, (x, y))
+        return canvas, True
+
+def main():
+    total_checked = 0
+    total_padded = 0
+    
+    argparser = argparse.ArgumentParser(description="Pad images to square")
+    argparser.add_argument("--root-dir", type=str, required=True, help="Root directory containing image folders")
+    argparser.add_argument("--pad-color", type=int, nargs=3, default=(255, 255, 255), help="Padding color as three integers (R G B)")
+    args = argparser.parse_args()
+    ROOT_DIR = args.root_dir
+    PAD_COLOR = tuple(args.pad_color)
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    for name in sorted(os.listdir(ROOT_DIR)):
+        folder = os.path.join(ROOT_DIR, name)
+        print(folder)
+        if not os.path.isdir(folder):
+            continue
+
+        if folder != "datasets/selected_nbg_wild/Alligator#Alligator_Act1": continue
+        print(f"Processing folder: {folder}")
+        for fname in os.listdir(folder):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in IMAGE_EXTS:
+                continue
+
+            path = os.path.join(folder, fname)
+
+            try:
+                out, changed = pad_to_square(path, PAD_COLOR)
+                total_checked += 1
+
+               
+                out.save(path)
+                total_padded += 1
+                print(f"  padded: {path} -> {out.size}")
+            except Exception as e:
+                print(f"  skip {path}: {e}")
+
+    print(f"\nDone. Checked {total_checked} images, padded {total_padded}.")
+
+
+if __name__ == "__main__":
+    main()

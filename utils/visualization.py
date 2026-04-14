@@ -1,4 +1,4 @@
-### visualization.py ###
+
 import os
 from typing import Optional
 import numpy as np
@@ -127,7 +127,7 @@ def plot_pose_compare_from_npy(
 
     writer = FFMpegWriter(fps=fps, bitrate=bitrate) if save_type == "mp4" else PillowWriter(fps=fps)
 
-    if camera_azim is not None:
+    if camera_azim is not None and not os.path.exists(camera_path):
         fig_camera = plt.figure(figsize=(4, 4))
         ax_camera = fig_camera.add_subplot(111, projection='3d')
         ax_camera.set_xlim(*lims[0])
@@ -183,123 +183,124 @@ def plot_pose_compare_from_npy(
         plt.close(fig_camera)
         print(f"[DONE] Saved camera view → {camera_path}")
 
-    # =========================================================
-    # Front view figure
-    # =========================================================
-    fig_front = plt.figure(figsize=(4, 4))
-    ax_front = fig_front.add_subplot(111, projection='3d')
-    ax_front.set_xlim(*lims[0])
-    ax_front.set_ylim(*lims[1])
-    ax_front.set_zlim(*lims[2])
-    ax_front.set_xlabel('-X')
-    ax_front.set_ylabel('Z')
-    ax_front.set_zlabel('Y')
-    ax_front.view_init(elev=15, azim=front_azim)
-    ax_front.set_title(f"{species_name} (Front)")
+    if front_azim is not None and not os.path.exists(front_path):
+        # =========================================================
+        # Front view figure
+        # =========================================================
+        fig_front = plt.figure(figsize=(4, 4))
+        ax_front = fig_front.add_subplot(111, projection='3d')
+        ax_front.set_xlim(*lims[0])
+        ax_front.set_ylim(*lims[1])
+        ax_front.set_zlim(*lims[2])
+        ax_front.set_xlabel('-X')
+        ax_front.set_ylabel('Z')
+        ax_front.set_zlabel('Y')
+        ax_front.view_init(elev=15, azim=front_azim)
+        ax_front.set_title(f"{species_name} (Front)")
 
-    scat_pred_front = ax_front.scatter([], [], [], s=10, c='blue', alpha=0.8, label='Pred')
-    scat_gt_front = None
-    if joints_gt is not None:
-        scat_gt_front = ax_front.scatter([], [], [], s=10, c='red', alpha=0.6, label='GT')
-        ax_front.legend()
-
-    lines_pred_front = []
-    lines_gt_front = []
-    for chain in ktree:
-        lp, = ax_front.plot([], [], [], lw=2, color='blue', alpha=0.8)
-        lines_pred_front.append((lp, chain))
+        scat_pred_front = ax_front.scatter([], [], [], s=10, c='blue', alpha=0.8, label='Pred')
+        scat_gt_front = None
         if joints_gt is not None:
-            lg, = ax_front.plot([], [], [], lw=2, color='red', alpha=0.6)
-            lines_gt_front.append((lg, chain))
+            scat_gt_front = ax_front.scatter([], [], [], s=10, c='red', alpha=0.6, label='GT')
+            ax_front.legend()
 
-    def update_front(frame):
-        jp = joints_pred[frame]
-        ims = []
+        lines_pred_front = []
+        lines_gt_front = []
+        for chain in ktree:
+            lp, = ax_front.plot([], [], [], lw=2, color='blue', alpha=0.8)
+            lines_pred_front.append((lp, chain))
+            if joints_gt is not None:
+                lg, = ax_front.plot([], [], [], lw=2, color='red', alpha=0.6)
+                lines_gt_front.append((lg, chain))
 
-        for lp, c in lines_pred_front:
-            lp.set_data(jp[c, 0], jp[c, 1])
-            lp.set_3d_properties(jp[c, 2])
-            ims.append(lp)
+        def update_front(frame):
+            jp = joints_pred[frame]
+            ims = []
 
-        scat_pred_front._offsets3d = (jp[:, 0], jp[:, 1], jp[:, 2])
-        ims.append(scat_pred_front)
+            for lp, c in lines_pred_front:
+                lp.set_data(jp[c, 0], jp[c, 1])
+                lp.set_3d_properties(jp[c, 2])
+                ims.append(lp)
 
-        if joints_gt is not None:
-            jg = joints_gt[frame]
-            for lg, c in lines_gt_front:
-                lg.set_data(jg[c, 0], jg[c, 1])
-                lg.set_3d_properties(jg[c, 2])
-                ims.append(lg)
+            scat_pred_front._offsets3d = (jp[:, 0], jp[:, 1], jp[:, 2])
+            ims.append(scat_pred_front)
 
-            scat_gt_front._offsets3d = (jg[:, 0], jg[:, 1], jg[:, 2])
-            ims.append(scat_gt_front)
+            if joints_gt is not None:
+                jg = joints_gt[frame]
+                for lg, c in lines_gt_front:
+                    lg.set_data(jg[c, 0], jg[c, 1])
+                    lg.set_3d_properties(jg[c, 2])
+                    ims.append(lg)
 
-        return ims
+                scat_gt_front._offsets3d = (jg[:, 0], jg[:, 1], jg[:, 2])
+                ims.append(scat_gt_front)
 
-    ani_front = FuncAnimation(fig_front, update_front, frames=F, interval=1000 / fps, blit=True)
-    ani_front.save(front_path, writer=writer)
-    plt.close(fig_front)
-    print(f"[DONE] Saved front view → {front_path}")
+            return ims
+
+        ani_front = FuncAnimation(fig_front, update_front, frames=F, interval=1000 / fps, blit=True)
+        ani_front.save(front_path, writer=writer)
+        plt.close(fig_front)
+        print(f"[DONE] Saved front view → {front_path}")
 
     
+    if side_azim is not None and not os.path.exists(side_path):
+        # =========================================================
+        # Side view figure
+        # =========================================================
+        fig_side = plt.figure(figsize=(4, 4))
+        ax_side = fig_side.add_subplot(111, projection='3d')
+        ax_side.set_xlim(*lims[0])
+        ax_side.set_ylim(*lims[1])
+        ax_side.set_zlim(*lims[2])
+        ax_side.set_xlabel('-X')
+        ax_side.set_ylabel('Z')
+        ax_side.set_zlabel('Y')
+        ax_side.view_init(elev=15, azim=side_azim)
+        ax_side.set_title(f"{species_name} (Side)")
 
-    # =========================================================
-    # Side view figure
-    # =========================================================
-    fig_side = plt.figure(figsize=(4, 4))
-    ax_side = fig_side.add_subplot(111, projection='3d')
-    ax_side.set_xlim(*lims[0])
-    ax_side.set_ylim(*lims[1])
-    ax_side.set_zlim(*lims[2])
-    ax_side.set_xlabel('-X')
-    ax_side.set_ylabel('Z')
-    ax_side.set_zlabel('Y')
-    ax_side.view_init(elev=15, azim=side_azim)
-    ax_side.set_title(f"{species_name} (Side)")
-
-    scat_pred_side = ax_side.scatter([], [], [], s=10, c='blue', alpha=0.8, label='Pred')
-    scat_gt_side = None
-    if joints_gt is not None:
-        scat_gt_side = ax_side.scatter([], [], [], s=10, c='red', alpha=0.6, label='GT')
-        ax_side.legend()
-
-    lines_pred_side = []
-    lines_gt_side = []
-    for chain in ktree:
-        lp, = ax_side.plot([], [], [], lw=2, color='blue', alpha=0.8)
-        lines_pred_side.append((lp, chain))
+        scat_pred_side = ax_side.scatter([], [], [], s=10, c='blue', alpha=0.8, label='Pred')
+        scat_gt_side = None
         if joints_gt is not None:
-            lg, = ax_side.plot([], [], [], lw=2, color='red', alpha=0.6)
-            lines_gt_side.append((lg, chain))
+            scat_gt_side = ax_side.scatter([], [], [], s=10, c='red', alpha=0.6, label='GT')
+            ax_side.legend()
 
-    def update_side(frame):
-        jp = joints_pred[frame]
-        ims = []
+        lines_pred_side = []
+        lines_gt_side = []
+        for chain in ktree:
+            lp, = ax_side.plot([], [], [], lw=2, color='blue', alpha=0.8)
+            lines_pred_side.append((lp, chain))
+            if joints_gt is not None:
+                lg, = ax_side.plot([], [], [], lw=2, color='red', alpha=0.6)
+                lines_gt_side.append((lg, chain))
 
-        for lp, c in lines_pred_side:
-            lp.set_data(jp[c, 0], jp[c, 1])
-            lp.set_3d_properties(jp[c, 2])
-            ims.append(lp)
+        def update_side(frame):
+            jp = joints_pred[frame]
+            ims = []
 
-        scat_pred_side._offsets3d = (jp[:, 0], jp[:, 1], jp[:, 2])
-        ims.append(scat_pred_side)
+            for lp, c in lines_pred_side:
+                lp.set_data(jp[c, 0], jp[c, 1])
+                lp.set_3d_properties(jp[c, 2])
+                ims.append(lp)
 
-        if joints_gt is not None:
-            jg = joints_gt[frame]
-            for lg, c in lines_gt_side:
-                lg.set_data(jg[c, 0], jg[c, 1])
-                lg.set_3d_properties(jg[c, 2])
-                ims.append(lg)
+            scat_pred_side._offsets3d = (jp[:, 0], jp[:, 1], jp[:, 2])
+            ims.append(scat_pred_side)
 
-            scat_gt_side._offsets3d = (jg[:, 0], jg[:, 1], jg[:, 2])
-            ims.append(scat_gt_side)
+            if joints_gt is not None:
+                jg = joints_gt[frame]
+                for lg, c in lines_gt_side:
+                    lg.set_data(jg[c, 0], jg[c, 1])
+                    lg.set_3d_properties(jg[c, 2])
+                    ims.append(lg)
 
-        return ims
+                scat_gt_side._offsets3d = (jg[:, 0], jg[:, 1], jg[:, 2])
+                ims.append(scat_gt_side)
 
-    ani_side = FuncAnimation(fig_side, update_side, frames=F, interval=1000 / fps, blit=True)
-    ani_side.save(side_path, writer=writer)
-    plt.close(fig_side)
-    print(f"[DONE] Saved side view → {side_path}")
+            return ims
+
+        ani_side = FuncAnimation(fig_side, update_side, frames=F, interval=1000 / fps, blit=True)
+        ani_side.save(side_path, writer=writer)
+        plt.close(fig_side)
+        print(f"[DONE] Saved side view → {side_path}")
 
     # =========================================================
     # Image figure

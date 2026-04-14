@@ -1,9 +1,7 @@
-
-    
-
-### video2pose2rot.py ###
 from math import e
 import os
+import shutil
+import subprocess
 import argparse
 import pickle
 import numpy as np
@@ -17,7 +15,7 @@ from utils.config_utils import load_yaml_config, instantiate_from_config
 from preprocess.briarmbg import BriaRMBG
 from TripoSG.triposg.pipelines.pipeline_triposg import TripoSGPipeline
 from animatrix.data.transform.fileio import BVHReader
-from utils.dist_utils import blender_visualize_character_motion
+from utils.mesh import blender_visualize_character_motion
 
 MAX_JOINTS=150
 
@@ -28,6 +26,57 @@ bvh_reader = BVHReader(
     bvh_norm=False,
     reset_pose_prob=0.0,
 )
+
+
+def get_video_frame_count(video_path):
+    """Use ffprobe to get frame count of a video. Returns -1 on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "csv=p=0",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        return int(result.stdout.strip())
+    except Exception as e:
+        logger.warning(f"[ffprobe] Failed to read frame count for {video_path}: {e}")
+        return -1
+
+
+def check_and_clean_output_dir(save_dir, expected_frames):
+    """
+    Walk save_dir for all .mp4 files. If any has frame count != expected_frames,
+    delete the ENTIRE save_dir (to avoid leftover mesh files causing GPU OOM)
+    and return True. Otherwise return False.
+    """
+    if not os.path.isdir(save_dir):
+        return False
+
+    for root, dirs, files in os.walk(save_dir):
+        for fname in files:
+            if not fname.endswith(".mp4"):
+                continue
+            mp4_path = os.path.join(root, fname)
+            fc = get_video_frame_count(mp4_path)
+            if fc < 0:
+                logger.warning(f"[CHECK] Cannot read {mp4_path}, deleting {save_dir} to be safe.")
+                shutil.rmtree(save_dir)
+                return True
+            if fc != expected_frames:
+                logger.warning(
+                    f"[CHECK] Frame mismatch: {mp4_path} has {fc} frames, expected {expected_frames}. "
+                    f"Deleting {save_dir} to regenerate."
+                )
+                shutil.rmtree(save_dir)
+                return True
+
+    return False
+
 
 def build_inference_batch(
     cfg,
@@ -113,27 +162,42 @@ def build_inference_batch(
     J = position.shape[1]
     J_max = MAX_JOINTS
 
+    if not cfg["data"]["wild_flag"]:
+        # --------------------------------------------------
+        # temporal align for inference
+        # mimic dataset output W = image_embed length used by model,
+        # while ensuring all modalities have same temporal length
+        # --------------------------------------------------
+        W_infer = image_embed_np.shape[0]
+        F_final = min(W_infer, position.shape[0], rot6d.shape[0])
+
+        if image_embed_np.shape[0] != F_final:
+            logger.info(f"[Truncate] input image_seq {image_embed_np.shape[0]} -> {F_final}")
+        if position.shape[0] != F_final:
+            logger.info(f"[Truncate] position_seq {position.shape[0]} -> {F_final}")
+        if rot6d.shape[0] != F_final:
+            logger.info(f"[Truncate] rot6d_seq {rot6d.shape[0]} -> {F_final}")
+
+        image_embed_np = image_embed_np[:F_final].astype(np.float32)
+        position = position[:F_final]
+        rot6d = rot6d[:F_final]
+        cfg["model"]["attention_kwargs"]["seq_len"] = F_final
+    else:
+        cfg["model"]["attention_kwargs"]["seq_len"] = image_embed_np.shape[0]
+
     # --------------------------------------------------
-    # temporal align for inference
-    # mimic dataset output W = image_embed length used by model,
-    # while ensuring all modalities have same temporal length
+    # Cap seq_len to MAX_SEQ_LEN and truncate data to match
     # --------------------------------------------------
-    W_infer = image_embed_np.shape[0]
-    F_final = min(W_infer, position.shape[0], rot6d.shape[0])
+    MAX_SEQ_LEN = 301
+    seq_len = cfg["model"]["attention_kwargs"]["seq_len"]
+    if seq_len > MAX_SEQ_LEN:
+        logger.info(f"[Cap] seq_len {seq_len} -> {MAX_SEQ_LEN}")
+        cfg["model"]["attention_kwargs"]["seq_len"] = MAX_SEQ_LEN
+        image_embed_np = image_embed_np[:MAX_SEQ_LEN]
+        position = position[:MAX_SEQ_LEN]
+        rot6d = rot6d[:MAX_SEQ_LEN]
 
-    if image_embed_np.shape[0] != F_final:
-        logger.info(f"[Truncate] input image_seq {image_embed_np.shape[0]} -> {F_final}")
-    if position.shape[0] != F_final:
-        logger.info(f"[Truncate] position_seq {position.shape[0]} -> {F_final}")
-    if rot6d.shape[0] != F_final:
-        logger.info(f"[Truncate] rot6d_seq {rot6d.shape[0]} -> {F_final}")
-
-    image_embed_np = image_embed_np[:F_final].astype(np.float32)
-    position = position[:F_final]
-    rot6d = rot6d[:F_final]
-
-    cfg["model"]["attention_kwargs"]["seq_len"] = F_final
-    ref_idx = min(ref_idx, F_final - 1)
+    ref_idx = min(ref_idx, 0)
 
     # dataset-like fields
     pos_win = position                          # [W, J, 3]
@@ -280,7 +344,37 @@ def inference(cfg, device, attention_design, model, pipe, rmbg_net, seq_name, im
     bvh_roots = cfg["data"]["bvh_roots"]
     species_name = batch["species"][0]
     save_dir_root = cfg["output"]["save_dir"]
-    
+    expected_seq_len = cfg["model"]["attention_kwargs"]["seq_len"]
+
+    # === Compute save_dir early for validation ===
+    save_subfolder = get_image_seq_relpath(image_folder, cfg["data"]["image_roots"])
+    test_name = image_folder.split("/")[-2]
+    save_dir = os.path.join(save_dir_root, cfg["experiment"]["exp"], test_name, save_subfolder)
+
+    # === Check existing mp4 frame counts; delete whole dir if mismatch ===
+    deleted = check_and_clean_output_dir(save_dir, expected_seq_len)
+    if deleted:
+        logger.info(f"[RERUN] Stale outputs deleted for {seq_name}, regenerating.")
+
+    # === If all outputs already valid, skip entirely ===
+    all_videos_ok = True
+    for subdir_name in ["camera", "front", "side"]:
+        subdir_path = os.path.join(save_dir, subdir_name)
+        if not os.path.isdir(subdir_path):
+            all_videos_ok = False
+            break
+        if not any(f.endswith(".mp4") for f in os.listdir(subdir_path)):
+            all_videos_ok = False
+            break
+
+    if all_videos_ok and os.path.isdir(save_dir):
+        npy_preds = [f for f in os.listdir(save_dir) if f.endswith("_pred.npy")]
+        if len(npy_preds) >= 2:
+            logger.info(f"[SKIP] All outputs valid for {seq_name}, skipping.")
+            return
+
+    os.makedirs(save_dir, exist_ok=True)
+
     # === Inference ===
     with torch.no_grad():
         model_out = model(batch, attention_kwargs=attention_design)
@@ -297,12 +391,6 @@ def inference(cfg, device, attention_design, model, pipe, rmbg_net, seq_name, im
         gt_rot = pred_rot
 
     # === Save results ===
-    save_subfolder = get_image_seq_relpath(image_folder, cfg["data"]["image_roots"])
-    test_name = image_folder.split("/")[-2]
-    save_dir = os.path.join(save_dir_root, cfg["experiment"]["exp"], test_name, save_subfolder)
-    os.makedirs(save_dir, exist_ok=True)
-
-
     species_actual = seq_name.split("#")[0]
     camera_azim = 90
     npy_pose_pred_path = os.path.join(save_dir, f"{species_name}_{species_actual}_pose_pred.npy")
@@ -353,22 +441,31 @@ def inference(cfg, device, attention_design, model, pipe, rmbg_net, seq_name, im
     if cfg["output"].get("blender_path", None) is not None and os.path.exists(cfg["output"]["blender_path"]):
         
         for azim in [(0, "camera"), (30, "front"), (-60, "side")]: # Need change
-            
-            blender_visualize_character_motion(
-                blender_path=cfg["output"]["blender_path"],
-                output_dir=os.path.join(save_dir, azim[1]),
-                scene="blank",
-                motion_path=npy_rot_pred_path.replace(".npy", ".bvh"),
-                character_folder=character_base_dir,
-                view_scale=1.8,
-                object_position=0.5,
-                camera_trace=True,
-                traj_smooth=0.0,
-                fps=cfg["output"].get("fps", 15),
-                auto_scale="bvh",
-                bg_color=(255, 255, 255),
-                azim=azim[0],
-            )
+
+            output_dir = os.path.join(save_dir, azim[1])
+            video_exists = any(
+                f.endswith(".mp4")
+                for f in os.listdir(output_dir)
+            ) if os.path.isdir(output_dir) else False
+
+            if video_exists:
+                logger.info(f"[SKIP] Video already exists in {output_dir}, skipping Blender export.")
+            else:
+                blender_visualize_character_motion(
+                    blender_path=cfg["output"]["blender_path"],
+                    output_dir=output_dir,
+                    scene="blank",
+                    motion_path=npy_rot_pred_path.replace(".npy", ".bvh"),
+                    character_folder=character_base_dir,
+                    view_scale=1.5,  # 1.8
+                    object_position=0.4,  # 0.05
+                    camera_trace=True,
+                    traj_smooth=0.0,
+                    fps=cfg["output"].get("fps", 15),
+                    auto_scale="bvh",
+                    bg_color=(255, 255, 255),
+                    azim=azim[0],
+                )
         
             # if cfg["output"].get("export_gt_video", True) and not wild_flag:
             #     blender_visualize_character_motion(
@@ -429,7 +526,7 @@ def video2pose2rot(cfg):
 
     # === Batch inference over IMAGE sequences ===
     image_seqs = find_all_valid_image_sequences(cfg["data"]["image_roots"])
-    image_seqs.sort()
+    # image_seqs.sort()
     logger.info(f"Found {len(image_seqs)} valid image sequences")
 
     for seq_name, image_folder in image_seqs:

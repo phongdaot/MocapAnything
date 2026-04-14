@@ -1,4 +1,3 @@
-### blender_mesh_utils.py ###
 import argparse
 import json
 import math
@@ -234,7 +233,6 @@ if __name__ == '__main__':
         args.use_mtl = False
 
     if args.use_mtl:
-        # Import base mesh
         exist = set(bpy.data.objects.keys())
         base_obj_path = os.path.join(args.character_folder, "base_mesh.obj")
         bpy.ops.wm.obj_import(filepath=base_obj_path)
@@ -270,34 +268,25 @@ if __name__ == '__main__':
                         tex_node = n
                         break
 
-                if tex_node is None or tex_node.image is None:
-                    print(f"No valid TEX_IMAGE node found in material {mat.name}")
-                    args.use_mtl = False
-                    continue
+                # texture is optional
+                if tex_node is not None and tex_node.image is not None:
+                    tex_name = os.path.basename(bpy.path.abspath(tex_node.image.filepath))
+                    tex_path = os.path.join(args.character_folder, tex_name)
 
-                # get filename from imported image datablock
-                tex_name = os.path.basename(bpy.path.abspath(tex_node.image.filepath))
-                tex_path = os.path.join(args.character_folder, tex_name)
+                    if os.path.exists(tex_path):
+                        img = bpy.data.images.load(tex_path, check_existing=True)
+                        tex_node.image = img
 
-                if not os.path.exists(tex_path):
-                    print(f"Texture not found on disk: {tex_path}")
-                    args.use_mtl = False
-                    continue
+                        base_color_input = principled.inputs['Base Color']
+                        for link in list(base_color_input.links):
+                            links.remove(link)
+                        links.new(tex_node.outputs['Color'], base_color_input)
+                    else:
+                        print(f"Texture not found on disk: {tex_path}, keeping imported material values.")
 
-                # reload from real disk path and replace imported datablock
-                img = bpy.data.images.load(tex_path, check_existing=True)
-                print(f"Replacing imported image {tex_node.image.name} with loaded image {img.name}")
-                tex_node.image = img
-
-                # reconnect Base Color
-                base_color_input = principled.inputs['Base Color']
-                for link in list(base_color_input.links):
-                    links.remove(link)
-                links.new(tex_node.outputs['Color'], base_color_input)
-
+                # common cleanup is still okay
                 principled.inputs['Roughness'].default_value = 0.7
 
-                # remove normal / bump
                 normal_in = principled.inputs.get('Normal')
                 if normal_in is not None:
                     for link in list(normal_in.links):
@@ -309,7 +298,6 @@ if __name__ == '__main__':
                             for link in list(out_sock.links):
                                 links.remove(link)
                         nodes.remove(n)
-
     for frame_idx in range(len(mesh_files)):
         # if frame_idx%5!=0 or frame_idx//5>5:continue
         obj_path = os.path.join(mesh_folder, mesh_files[frame_idx])
