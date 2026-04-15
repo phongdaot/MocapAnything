@@ -22,7 +22,7 @@ A reference frame (a single pose from a matching species) is used to guide the p
 mocapv2/
 ├── configs/              # YAML configs for each training and inference task
 ├── data/                 # Dataset loaders (loader_v1.py, loader_v2.py)
-├── model/
+├── models/
 │   ├── v1/               # mesh2pose, video2mesh (TripoSG)
 │   └── v2/               # video2pose, video2pose2, pose2rot, video2pose2rot
 ├── preprocess/           # Image preprocessing, background removal, data preparation
