@@ -34,7 +34,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from data.loader_video2mesh import FullSequenceLatentDataset
-from model.v1.video2mesh.triposg_transformer import TripoSGDiTModel4D
+from models.v1.video2mesh.triposg_transformer import TripoSGDiTModel4D
 from utils.config_utils import dump_yaml_config, load_yaml_config
 from utils.dist_utils import (
     cleanup_distributed,
