@@ -33,6 +33,10 @@ pip-delete-this-directory.txt
 .ipynb_checkpoints
 *.ipynb
 
+# Datasets
+datasets/
+datasets
+
 # Unit test / coverage
 htmlcov/
 .tox/

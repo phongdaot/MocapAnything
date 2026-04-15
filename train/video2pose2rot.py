@@ -170,6 +170,7 @@ def save_rot_npy(save_dir, name, pred, gt):
 def visualize_joint_sample(
     save_dir,
     species_name,
+    character_dir,
     pred_pos,
     gt_pos,
     pred_rot,
@@ -190,8 +191,8 @@ def visualize_joint_sample(
     )
 
     # 转 BVH
-    convert_npy_to_bvh(rot_pred_path, species_name)
-    convert_npy_to_bvh(rot_gt_path, species_name)
+    convert_npy_to_bvh(rot_pred_path, character_dir, species_name)
+    convert_npy_to_bvh(rot_gt_path, character_dir, species_name)
 
 # =========================================================
 # eval
@@ -204,6 +205,7 @@ def run_evaluation(
     cfg,
     pose_pred_prob,
     base_dir,
+    character_dir,
     writer=None,
     epoch=None,
     tag_prefix="test",
@@ -236,7 +238,7 @@ def run_evaluation(
     vis_done_species = set()
     max_vis_species = 50
 
-    vis_save_dir = os.path.join(base_dir, f"vis_video2pose2rot_epoch{epoch}")
+    vis_save_dir = os.path.join(base_dir, f"vis_video2pose2rot_epoch{epoch + 1}")
     if is_main_process() and (epoch + 1) % cfg["train"]["vis_every"] == 0:
         os.makedirs(vis_save_dir, exist_ok=True)
 
@@ -286,6 +288,7 @@ def run_evaluation(
                         visualize_joint_sample(
                             save_dir=vis_save_dir,
                             species_name=species_name,
+                            character_dir=character_dir,
                             pred_pos=pred_pos,
                             gt_pos=gt_pos,
                             pred_rot=pred_rot,
@@ -595,6 +598,7 @@ def train_video2pose2rot(cfg):
                     epoch=epoch + 1,
                     tag_prefix=tag_prefix,
                     base_dir=base_dir,
+                    character_dir=data_cfg["character_dir"],
                 )
                 split_metrics[split] = metrics
 
