@@ -60,7 +60,11 @@ def run_evaluation(
     vis_done_species = set()
 
     with torch.no_grad():
-        for bi, batch in enumerate(tqdm_loader):
+        cnt = 0
+        for bi, batch in enumerate(tqdm_loader):            
+            cnt += 1
+            if cfg["runtime"]["debug"] and cnt >= 10: break
+
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
@@ -113,7 +117,7 @@ def run_evaluation(
                 test_speed_l1 += speed_l1.item() * n_speed
                 test_speed_l2 += speed_l2.item() * n_speed
                 test_mpjve += mpjve.item() * n_speed
-                test_speed_cnt += n_speed
+                speed_cnt += n_speed
 
             if is_main_process() and vis_save_dir is not None:
                 os.makedirs(vis_save_dir, exist_ok=True)
@@ -160,7 +164,7 @@ def run_evaluation(
     test_loss_l2 /= sample_count
     test_mpjpe /= sample_count
     
-    if test_speed_cnt > 0:
+    if speed_cnt > 0:
         test_speed_l1 /= speed_cnt
         test_speed_l2 /= speed_cnt
         test_mpjve /= speed_cnt
@@ -401,7 +405,11 @@ def train_mesh2pose(cfg):
 
         batch_times = []
 
+        cnt = 0
         for i, batch in loader_tqdm:
+            cnt += 1
+            if cfg["runtime"]["debug"] and cnt >= 10: break
+
             batch_start_time = time.time()
 
             for k, v in batch.items():
