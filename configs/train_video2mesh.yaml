@@ -1,0 +1,93 @@
+
+### train_video2mesh.yaml ###
+name: "Video2Mesh (TripoSG temporal DiT) training"
+
+runtime:
+  device: "cuda"
+  seed: 42
+  debug: false
+
+output:
+  checkpoint_root: "./checkpoints/video2mesh"
+
+experiment:
+  exp: "exp0821_temporal"
+
+model:
+  # Must point to a directory containing config.json + diffusion_pytorch_model.safetensors
+  # for TripoSGDiTModel4D (e.g. the `transformer` sub-folder of the TripoSG release).
+  pretrained_model_path: "./checkpoints/TripoSG_temporal/transformer"
+
+  # RectifiedFlowScheduler config JSON (shipped with the TripoSG release).
+  scheduler_config_path: "./checkpoints/TripoSG_temporal/scheduler/scheduler_config.json"
+
+  gradient_checkpointing: true
+
+  # Sent verbatim to TripoSGDiTModel4D.forward(attention_kwargs=...).
+  # `seq_len` is also used as the training window length.
+  attention_kwargs:
+    seq_len: 16
+    selfatt_temporal_layer_flag: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 3
+    crossatt2_slidwindow: 5
+
+data:
+  # One or more directories of precomputed (image_embed, latent) .npz files.
+  # Multiple directories can be given as a comma-separated string or a YAML list.
+  npz_dirs:
+    - "datasets/zoo1030/npz_train_withglobal"
+
+  image_key: "image_embed"
+  latent_key: "latent"
+
+  frame_step: 1           # stride between frames inside one window
+  hop: 1                  # stride between consecutive windows
+  drop_last: true
+  preload: false
+  mmap_mode: "r"
+  num_threads: 32
+
+  # Optional: JSON (relative to the first npz_dirs' parent, name without ".json")
+  # whose values are lists of sequence folder names to exclude.
+  skip_json: "selected_test_split"
+
+train:
+  num_epochs: 10000
+  batch_size: 1
+  num_workers: 4
+
+  lr: 1.0e-4
+  weight_decay: 0.0
+
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+  save_every: 300
+  log_every_n_steps: 50
+
+  use_amp: true
+  amp_dtype: "bf16"       # one of: bf16 | fp16
+
+  # Classifier-free guidance dropout on the image conditioning.
+  uncond_dropout_prob: 0.1
+  # Shape of the TripoSG image encoder output; only used to build the zero token.
+  uncond_seq_len: 257
+  uncond_dim: 1024
+
+  # Rectified-flow timestep sampling + loss weighting.
+  timestep_sampling_weighting: "logit_normal"   # logit_normal | logit_normal_dist | mode | uniform
+  loss_weighting_scheme: "sigma_sqrt"           # sigma_sqrt | cosmap | none
+  logit_mean: 0.0
+  logit_std: 1.0
+
+  resume: false
+
+lora:
+  use_lora: false         # toggle to true to train LoRA adapters instead of full weights
+  rank: 4
+  alpha: 4
+  dropout: 0.0
+  target_mode: "all"      # "all" | "qkv"
+  merge_on_save: true     # merge LoRA into a full-weight transformer/ on every save
