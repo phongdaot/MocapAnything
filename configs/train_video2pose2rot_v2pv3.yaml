@@ -13,11 +13,11 @@ experiment:
   exp: video2pose2rot_v2pv3_base
 
 model:
-  target: model.v2.video2pose2rot.model.Video2Pose2RotModel
+  target: models.v2.video2pose2rot.model.Video2Pose2RotModel
   params:
 
     v2p_cfg:
-      target: model.v2.video2pose_v3.model.RefGuidedVideo2PoseModel
+      target: models.v2.video2pose_v3.model.RefGuidedVideo2PoseModel
       params:
         q_dim: 256
         num_layers: 12
@@ -32,7 +32,7 @@ model:
         dropout: 0.1
 
     p2r_cfg:
-      target: model.v2.pose2rot.model.Pose2RotMemoryRestModel
+      target: models.v2.pose2rot.model.Pose2RotMemoryRestModel
       params:
         q_dim: 256
         rest_layers: 4

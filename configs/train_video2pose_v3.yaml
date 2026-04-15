@@ -13,7 +13,7 @@ experiment:
   exp: "exp_v3_base"
 
 model:
-  target: "model.v3.video2pose.model.RefGuidedVideo2PoseModel"
+  target: "models.v3.video2pose.model.RefGuidedVideo2PoseModel"
 
   params:
     q_dim: 256
