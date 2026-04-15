@@ -9,3 +9,6 @@ torchrun --nproc_per_node=8 --master_port=12345 -m train.video2pose \
     
 torchrun --nproc_per_node=8 --master_port=12345 -m train.video2pose2rot \
     --config configs/train/train_video2pose2rot.yaml
+
+torchrun --nproc_per_node=8 --master_port=12345 -m train.video2mesh \
+    --config configs/train_video2mesh.yaml
