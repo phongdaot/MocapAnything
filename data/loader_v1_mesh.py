@@ -1,187 +1,273 @@
 
 ### loader_v1_mesh.py ###
-# Dataset for training video2mesh (TripoSG-style flow-matching DiT).
+# Dataset for training the video2mesh temporal DiT with RectifiedFlow.
 #
-# Consumes the .npz files produced by preprocess/preprocess_data.py, which
-# contain per-frame pairs of (VAE-encoded mesh latent, DinoV2 image embedding).
-# Each .npz holds:
-#     latent:      [T, num_tokens, latent_dim]       e.g. [T, 2048, 64]
-#     image_embed: [T, cond_tokens, cond_dim]        e.g. [T, 257, 1024]
+# Consumes .npz files produced by preprocess/preprocess_data.py, each holding:
+#     image_embed: [T, 257, 1024]   (frozen DinoV2 embedding, per-frame)
+#     latent:      [T, 2048, 64]    (VAE-encoded mesh latent, per-frame)
 #
-# The dataset walks a root directory recursively for .npz files, applies an
-# optional JSON split, and yields fixed-length windows suitable for the
-# temporal DiT in model/v1/video2mesh.
+# Sliding windows of length ``seq_len`` are produced from every sequence.
+# A JSON skip-list (typically the test split) can be applied to drop
+# held-out sequences. Meta information (per-file frame count) is cached on
+# disk so subsequent runs don't need to re-scan every .npz.
 
 import json
 import os
-import random
-from typing import Any, Dict, List, Optional
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
-def _find_all_npz(root: str) -> List[str]:
-    out = []
-    for dirpath, _, filenames in os.walk(root):
-        for f in filenames:
-            if f.endswith(".npz"):
-                out.append(os.path.join(dirpath, f))
-    out.sort()
-    return out
+def _natural_sort_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
-def _load_split_ids(split_json: Optional[str], split_mode: str) -> Optional[set]:
+def _print_rank0(*args, **kwargs):
+    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+        print(*args, **kwargs)
+
+
+def load_or_cache_meta(
+    files: List[str],
+    num_threads: int = 16,
+    preload: bool = False,
+    mmap_mode: Optional[str] = "r",
+    cache_path: Optional[str] = None,
+):
     """
-    Load a set of allowed sample ids from a split JSON.
-
-    Expected JSON layout (flexible):
-        {"train": [...], "test": [...]} -> list of relative paths or ids
-    Returns None when no split filtering should be applied.
+    Load per-file meta (``T``) from .npz files, caching the result as JSON.
+    DDP safe: rank 0 does the scan + write, other ranks wait on a barrier
+    and then read the cache.
     """
-    if split_json is None or not os.path.exists(split_json):
-        return None
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    is_main = rank == 0
 
-    with open(split_json, "r") as f:
-        data = json.load(f)
+    def load_meta_single(p):
+        if preload:
+            arr = np.load(p, mmap_mode=None)
+            img = np.asarray(arr["image_embed"])
+            lat = np.asarray(arr["latent"])
+            if img.shape[0] != lat.shape[0]:
+                raise ValueError(f"Frame count mismatch in {p}")
+            return {"img": img, "lat": lat, "T": int(img.shape[0]), "path": p}
+        else:
+            arr = np.load(p, mmap_mode=mmap_mode)
+            try:
+                T = int(arr["image_embed"].shape[0])
+            finally:
+                arr.close()
+            return {"path": p, "T": T}
 
-    if isinstance(data, list):
-        ids = data
-    elif isinstance(data, dict):
-        ids = data.get(split_mode, None)
-        if ids is None:
-            return None
-    else:
-        return None
+    if cache_path is None:
+        first_dir = os.path.dirname(os.path.commonpath(files))
+        cache_path = os.path.join(first_dir, "dataset_meta_cache.json")
 
-    return set(str(x) for x in ids)
+    if is_main:
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    cached = json.load(f)
+                if isinstance(cached, list) and all("path" in m and "T" in m for m in cached):
+                    _print_rank0(
+                        f"[INFO][Rank0] Loaded meta cache: {len(cached)} files "
+                        f"({cache_path})"
+                    )
+                    if distributed:
+                        dist.barrier()
+                    return cached
+                else:
+                    _print_rank0(f"[WARN][Rank0] cache structure invalid, rescanning.")
+            except Exception as e:
+                _print_rank0(f"[WARN][Rank0] failed to read cache: {e}, rescanning.")
+
+        _print_rank0(
+            f"[INFO][Rank0] Scanning meta for {len(files)} files "
+            f"(threads={num_threads})"
+        )
+        loaded = []
+        with ThreadPoolExecutor(max_workers=num_threads) as ex:
+            futures = {ex.submit(load_meta_single, p): p for p in files}
+            for f in tqdm(as_completed(futures), total=len(futures), ncols=100, desc="[Load meta]"):
+                try:
+                    loaded.append(f.result())
+                except Exception as e:
+                    _print_rank0(f"[WARN] failed {futures[f]}: {e}")
+        _print_rank0(f"[INFO][Rank0] meta loaded: {len(loaded)} files")
+
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(loaded, f, indent=2)
+            _print_rank0(f"[INFO][Rank0] meta cached to {cache_path}")
+        except Exception as e:
+            _print_rank0(f"[WARN][Rank0] failed to save cache: {e}")
+
+        if distributed:
+            dist.barrier()
+        return loaded
+
+    # non-main ranks: wait and read
+    if distributed:
+        dist.barrier()
+    with open(cache_path, "r") as f:
+        return json.load(f)
 
 
-class VideoMeshLatentDataset(Dataset):
+class FullSequenceLatentDataset(Dataset):
     """
-    Dataset of pre-computed (mesh latent, image embedding) sequences for
-    training the video2mesh temporal DiT with flow matching.
+    Sliding-window dataset of (image_embed, latent) pairs from preprocessed
+    .npz files.
     """
 
     def __init__(
         self,
-        npz_dir: str,
-        window: int = 16,
-        split_json: Optional[str] = None,
-        split_mode: str = "train",
-        min_frames: Optional[int] = None,
-        preload_all: bool = False,
-        debug_limit: Optional[int] = None,
+        npz_dirs,
+        seq_len: int = 16,
+        image_key: str = "image_embed",
+        latent_key: str = "latent",
+        frame_step: int = 1,
+        hop: Optional[int] = None,
+        drop_last: bool = True,
+        preload: bool = False,
+        mmap_mode: Optional[str] = "r",
+        num_threads: int = 32,
+        skip_json: Optional[str] = None,
     ):
         super().__init__()
+        self.seq_len = int(seq_len)
+        self.image_key = image_key
+        self.latent_key = latent_key
+        self.frame_step = int(frame_step)
+        self.hop = int(hop) if hop is not None else self.seq_len
+        self.drop_last = drop_last
+        self.preload = preload
+        self.mmap_mode = None if preload else mmap_mode
+        self.num_threads = num_threads
 
-        self.npz_dir = npz_dir
-        self.window = int(window)
-        self.split_mode = split_mode
-        self.preload_all = preload_all
-        self.min_frames = min_frames if min_frames is not None else self.window
+        # Gather .npz files
+        if isinstance(npz_dirs, str):
+            npz_dirs = [d.strip() for d in npz_dirs.split(",") if d.strip()]
 
-        all_npz = _find_all_npz(npz_dir)
-        allowed = _load_split_ids(split_json, split_mode)
+        files: List[str] = []
+        for npz_dir in npz_dirs:
+            if not os.path.isdir(npz_dir):
+                raise ValueError(f"{npz_dir} is not a directory")
+            for root, _, fnames in os.walk(npz_dir):
+                for f in fnames:
+                    if f.endswith(".npz"):
+                        files.append(os.path.join(root, f))
+        files.sort(key=_natural_sort_key)
 
-        items: List[Dict[str, Any]] = []
-        for p in all_npz:
-            rel = os.path.relpath(p, npz_dir)
-            sample_id = os.path.splitext(rel)[0]  # drop .npz
+        # Apply skip list (held-out sequences)
+        if skip_json is not None:
+            skip_path = skip_json
+            if not os.path.isabs(skip_path):
+                # resolve relative to the first dataset dir
+                skip_path = os.path.join(os.path.dirname(npz_dirs[0]), skip_json)
+                if not skip_path.endswith(".json"):
+                    skip_path = skip_path + ".json"
 
-            if allowed is not None and sample_id not in allowed and rel not in allowed:
+            if os.path.exists(skip_path):
+                with open(skip_path, "r") as f:
+                    skip_dict = json.load(f)
+                skip_list = set()
+                if isinstance(skip_dict, dict):
+                    for v in skip_dict.values():
+                        if isinstance(v, list):
+                            skip_list.update(v)
+                elif isinstance(skip_dict, list):
+                    skip_list.update(skip_dict)
+
+                _print_rank0(f"[INFO] skip list: {len(skip_list)} sequences ({skip_path})")
+                kept = [
+                    f for f in files
+                    if os.path.basename(os.path.dirname(f)) not in skip_list
+                ]
+                _print_rank0(
+                    f"[DEBUG] original files={len(files)} kept={len(kept)}"
+                )
+                files = kept
+
+        if not files:
+            raise FileNotFoundError(f"No npz files found under {npz_dirs}")
+        self.files = files
+
+        cache_path = os.path.join(
+            os.path.dirname(npz_dirs[0]), "dataset_meta_cache.json"
+        )
+        self._loaded = load_or_cache_meta(
+            self.files,
+            num_threads=self.num_threads,
+            preload=self.preload,
+            mmap_mode=self.mmap_mode,
+            cache_path=cache_path,
+        )
+
+        # Build sliding window index
+        self._index: List[Tuple[int, int]] = []
+        for fi, meta in enumerate(self._loaded):
+            T = meta["T"]
+            max_start = T - (self.seq_len - 1) * self.frame_step
+            end = max(0, max_start) if self.drop_last else T
+            if self.drop_last and max_start <= 0:
                 continue
+            start = 0
+            while start < end:
+                self._index.append((fi, start))
+                start += self.hop
 
-            items.append({
-                "path": p,
-                "rel": rel,
-                "sample_id": sample_id,
-            })
+        if not self._index:
+            if self.drop_last:
+                raise ValueError(
+                    "No valid sequence windows. Try smaller seq_len/frame_step or drop_last=False."
+                )
+            self._index.append((0, 0))
 
-            if debug_limit is not None and len(items) >= debug_limit:
-                break
+    def __len__(self):
+        return len(self._index)
 
-        # Filter + cache length metadata.
-        self.items: List[Dict[str, Any]] = []
-        self._preloaded: Dict[str, Dict[str, np.ndarray]] = {}
+    def _load_arrays(self, fi: int):
+        meta = self._loaded[fi]
+        if self.preload:
+            return meta["img"], meta["lat"]
+        arr = np.load(meta["path"], mmap_mode=self.mmap_mode)
+        img = arr[self.image_key]
+        lat = arr[self.latent_key]
+        return img, lat
 
-        for it in items:
-            try:
-                with np.load(it["path"], allow_pickle=False) as z:
-                    n = z["latent"].shape[0]
-                    ne = z["image_embed"].shape[0]
-                    if n != ne:
-                        continue
-                    if n < self.min_frames:
-                        continue
-                    it["num_frames"] = int(n)
-                    it["latent_shape"] = tuple(z["latent"].shape)
-                    it["embed_shape"] = tuple(z["image_embed"].shape)
-                    if preload_all:
-                        self._preloaded[it["path"]] = {
-                            "latent": z["latent"].astype(np.float32),
-                            "image_embed": z["image_embed"].astype(np.float32),
-                        }
-                self.items.append(it)
-            except Exception as e:
-                # Skip corrupted or incomplete files silently.
-                continue
+    def __getitem__(self, idx: int):
+        fi, start = self._index[idx]
+        img_np, lat_np = self._load_arrays(fi)
+        T = img_np.shape[0]
+        idxs = start + np.arange(self.seq_len) * self.frame_step
 
-    def __len__(self) -> int:
-        return len(self.items)
+        if self.drop_last:
+            img_win = img_np[idxs]
+            lat_win = lat_np[idxs]
+        else:
+            valid = idxs < T
+            idxs = idxs[valid]
+            img_win = img_np[idxs]
+            lat_win = lat_np[idxs]
+            if img_win.shape[0] < self.seq_len:
+                pad = self.seq_len - img_win.shape[0]
+                img_win = np.concatenate([img_win, np.repeat(img_win[-1:], pad, axis=0)], axis=0)
+                lat_win = np.concatenate([lat_win, np.repeat(lat_win[-1:], pad, axis=0)], axis=0)
 
-    def _load(self, it: Dict[str, Any]):
-        if it["path"] in self._preloaded:
-            arrs = self._preloaded[it["path"]]
-            return arrs["latent"], arrs["image_embed"]
-        with np.load(it["path"], allow_pickle=False) as z:
-            latent = z["latent"].astype(np.float32)
-            image_embed = z["image_embed"].astype(np.float32)
-        return latent, image_embed
+        return (
+            torch.from_numpy(np.asarray(img_win)).float(),
+            torch.from_numpy(np.asarray(lat_win)).float(),
+        )
 
-    def _pick_window(self, n: int) -> int:
-        if n <= self.window:
-            return 0
-        if self.split_mode == "train":
-            return random.randint(0, n - self.window)
-        # Deterministic window for eval: center crop.
-        return max(0, (n - self.window) // 2)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        it = self.items[idx]
-        latent, image_embed = self._load(it)
-        n = latent.shape[0]
-
-        start = self._pick_window(n)
-        end = start + self.window
-
-        lat_win = latent[start:end]            # [T, N, D_latent]
-        img_win = image_embed[start:end]       # [T, C, D_cond]
-
-        # Pad at the end if the clip is shorter than the window.
-        if lat_win.shape[0] < self.window:
-            pad = self.window - lat_win.shape[0]
-            lat_win = np.concatenate(
-                [lat_win, np.repeat(lat_win[-1:], pad, axis=0)], axis=0
-            )
-            img_win = np.concatenate(
-                [img_win, np.repeat(img_win[-1:], pad, axis=0)], axis=0
-            )
-
-        return {
-            "latent": torch.from_numpy(lat_win).float(),          # [T, N, D_latent]
-            "image_embed": torch.from_numpy(img_win).float(),     # [T, C, D_cond]
-            "sample_id": it["sample_id"],
-            "start": start,
-        }
-
-
-def collate_video_mesh(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out = {
-        "latent": torch.stack([b["latent"] for b in batch], dim=0),           # [B, T, N, D]
-        "image_embed": torch.stack([b["image_embed"] for b in batch], dim=0), # [B, T, C, D]
-        "sample_id": [b["sample_id"] for b in batch],
-        "start": torch.tensor([b["start"] for b in batch], dtype=torch.long),
-    }
-    return out
+    def get_full_sequence(self, file_idx: int = 0):
+        img_np, lat_np = self._load_arrays(file_idx)
+        return (
+            torch.from_numpy(np.asarray(img_np)).float(),
+            torch.from_numpy(np.asarray(lat_np)).float(),
+        )

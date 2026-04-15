@@ -2,47 +2,55 @@
 ### video2mesh.py ###
 # Training script for the video2mesh temporal DiT (TripoSGDiTModel4D).
 #
-# Assumes the dataset has already been preprocessed with
-# preprocess/preprocess_data.py, which stores per-sample .npz files of
-# (VAE-encoded mesh latent, frozen DinoV2 image embedding) sequences.
-# Training optimises only the transformer using flow matching on the
-# frozen latents — the VAE and image encoder are not needed here.
+# Port of train_s2_0821_ddp.py (LoRA + RectifiedFlow + CFG dropout) into the
+# mocapv2 project style (YAML-driven, shared dist/log utilities).
+#
+# The dataset must already be preprocessed with preprocess/preprocess_data.py,
+# producing per-sample .npz files containing:
+#     image_embed: [T, 257, 1024]   frozen DinoV2 embeddings
+#     latent:      [T, 2048, 64]    VAE-encoded mesh latents
+#
+# Only the transformer is trained here (VAE + image encoder are frozen and
+# already applied during preprocessing).
 
-import os
-import time
-import math
 import argparse
-from typing import Dict, Any, Optional
-
-import numpy as np
-from tqdm import tqdm
+import copy
+import json
+import os
+import re
+from datetime import datetime
+from typing import List, Optional
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
-from utils.dist_utils import (
-    setup_distributed,
-    is_main_process,
-    cleanup_distributed,
-    worker_init_fn,
-    reduce_sum_scalar,
-)
-from utils.train_utils import (
-    save_checkpoint_with_epoch,
-    cleanup_old_checkpoints,
-    find_latest_ckpt,
-    load_checkpoint,
-    load_partial_pretrain,
-)
+from data.loader_v1_mesh import FullSequenceLatentDataset
+from models.v1.video2mesh.triposg_transformer import TripoSGDiTModel4D
 from utils.common import set_seed
+from utils.config_utils import load_yaml_config, dump_yaml_config
+from utils.dist_utils import (
+    cleanup_distributed,
+    is_main_process,
+    setup_distributed,
+)
 from utils.logger import logger
-from utils.config_utils import load_yaml_config, dump_yaml_config, instantiate_from_config
 
-from data.loader_v1_mesh import VideoMeshLatentDataset, collate_video_mesh
+# RectifiedFlow scheduler comes from the TripoSG package (same as preprocess/).
+from TripoSG.triposg.schedulers.scheduling_rectified_flow import (
+    RectifiedFlowScheduler,
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting,
+)
+
+try:
+    from diffusers.models.lora import LoRACompatibleLinear
+except Exception:  # diffusers moved this around across versions
+    LoRACompatibleLinear = None
 
 torch.multiprocessing.set_start_method("spawn", force=True)
 
@@ -50,234 +58,182 @@ PROCESS_NAME = "video2mesh"
 
 
 # =========================================================
-# flow-matching helpers
+# checkpoint io
 # =========================================================
-def _sample_flow_matching_t(
-    batch_size: int,
-    device: torch.device,
-    schedule: str = "uniform",
-    logit_normal_mean: float = 0.0,
-    logit_normal_std: float = 1.0,
-) -> torch.Tensor:
-    """
-    Sample flow-matching time parameter u in (0, 1) per sample.
-
-    schedule:
-        uniform       : u ~ U(0, 1)
-        logit_normal  : u = sigmoid(N(mean, std))  (as used in SD3/Flux)
-    """
-    if schedule == "uniform":
-        u = torch.rand(batch_size, device=device)
-    elif schedule == "logit_normal":
-        z = torch.randn(batch_size, device=device) * logit_normal_std + logit_normal_mean
-        u = torch.sigmoid(z)
-    else:
-        raise ValueError(f"Unknown flow matching schedule: {schedule}")
-
-    # Clamp away from endpoints for numerical stability.
-    return u.clamp(1e-5, 1.0 - 1e-5)
+def _find_latest_step_ckpt(root: str) -> Optional[str]:
+    if not os.path.isdir(root):
+        return None
+    max_step = -1
+    latest = None
+    for name in os.listdir(root):
+        m = re.match(r"checkpoint_step_(\d+)", name)
+        if m:
+            step = int(m.group(1))
+            if step > max_step:
+                max_step = step
+                latest = os.path.join(root, name)
+    return latest
 
 
-def compute_flow_matching_loss(
-    transformer: nn.Module,
-    latent: torch.Tensor,           # [B, T, N, D]
-    image_embed: torch.Tensor,      # [B, T, C, D_cond]
-    attention_kwargs: Optional[Dict[str, Any]],
-    t_schedule: str,
-    t_mean: float,
-    t_std: float,
-    timestep_scale: float,
-    loss_type: str = "l2",
-):
-    """
-    Standard rectified-flow / flow-matching loss:
-        x_0 = data (mesh latent)
-        x_1 = noise ~ N(0, I)
-        x_t = (1 - u) x_0 + u x_1
-        target = x_1 - x_0
-        pred   = transformer(x_t, t_model, cond)
-        loss   = || pred - target ||
-    """
-    B = latent.shape[0]
-    device = latent.device
-
-    u = _sample_flow_matching_t(
-        batch_size=B,
-        device=device,
-        schedule=t_schedule,
-        logit_normal_mean=t_mean,
-        logit_normal_std=t_std,
-    )
-    # Broadcast u over [T, N, D] dims.
-    u_b = u.view(B, 1, 1, 1).to(latent.dtype)
-
-    noise = torch.randn_like(latent)
-    x_t = (1.0 - u_b) * latent + u_b * noise
-    target = noise - latent
-
-    # TripoSG expects the timestep in [0, 1000] range (positional embedding).
-    timestep = (u * timestep_scale).to(latent.dtype)
-
-    pred_out = transformer(
-        hidden_states=x_t,
-        timestep=timestep,
-        encoder_hidden_states=image_embed,
-        attention_kwargs=attention_kwargs,
-        return_dict=False,
-    )
-    pred = pred_out[0]
-
-    if loss_type == "l2":
-        per_sample = (pred.float() - target.float()).pow(2).mean(dim=[1, 2, 3])
-    elif loss_type == "l1":
-        per_sample = (pred.float() - target.float()).abs().mean(dim=[1, 2, 3])
-    elif loss_type == "smooth_l1":
-        per_sample = nn.functional.smooth_l1_loss(
-            pred.float(), target.float(), reduction="none"
-        ).mean(dim=[1, 2, 3])
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
-
-    loss = per_sample.mean()
-    return loss, {
-        "loss": loss.detach(),
-        "u_mean": u.mean().detach(),
-        "u_std": u.std(unbiased=False).detach() if B > 1 else torch.zeros((), device=device),
-    }
-
-
-# =========================================================
-# dataloaders
-# =========================================================
-def build_dataloaders(data_cfg, train_cfg, eval_cfg, attention_design, distributed, rank, world_size):
-    window = attention_design["seq_len"]
-
-    train_ds = VideoMeshLatentDataset(
-        npz_dir=data_cfg["npz_dir"],
-        window=window,
-        split_json=data_cfg.get("split_json"),
-        split_mode="train",
-        min_frames=data_cfg.get("min_frames"),
-        preload_all=data_cfg.get("preload_all", False),
-        debug_limit=data_cfg.get("debug_limit"),
-    )
-
-    train_sampler = (
-        DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
-        if distributed else None
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=train_cfg["batch_size"],
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=train_cfg.get("num_workers_train", 4),
-        collate_fn=collate_video_mesh,
-        worker_init_fn=worker_init_fn,
-        drop_last=True,
-    )
-
-    eval_ds = VideoMeshLatentDataset(
-        npz_dir=data_cfg["npz_dir"],
-        window=window,
-        split_json=data_cfg.get("split_json"),
-        split_mode="test",
-        min_frames=data_cfg.get("min_frames"),
-        preload_all=data_cfg.get("preload_all", False),
-        debug_limit=data_cfg.get("debug_limit"),
-    )
-
-    if len(eval_ds) == 0:
+def auto_resume_and_load(model, optimizer, output_dir, device, is_lora=False):
+    """Restore the latest checkpoint_step_{N} under ``output_dir``."""
+    ckpt_dir = _find_latest_step_ckpt(output_dir)
+    if ckpt_dir is None:
         if is_main_process():
-            logger.info("[video2mesh] No test split found — evaluation will be skipped.")
-        eval_loader = None
+            logger.info(f"[resume] no checkpoint under {output_dir}, starting from step 0")
+        return 0
+
+    if is_main_process():
+        logger.info(f"[resume] loading {ckpt_dir}")
+
+    adapter_path = os.path.join(ckpt_dir, "adapter_model.safetensors")
+    full_path = os.path.join(ckpt_dir, "diffusion_pytorch_model.safetensors")
+
+    if is_lora and os.path.exists(adapter_path):
+        model.load_adapter(ckpt_dir, "default", is_trainable=True)
+        if is_main_process():
+            logger.info(f"[resume] loaded LoRA adapter from {ckpt_dir}")
+    elif os.path.exists(full_path):
+        from safetensors.torch import load_file
+        device_str = str(device)
+        state_dict = load_file(full_path, device=device_str)
+        model.load_state_dict(state_dict)
+        if is_main_process():
+            logger.info(f"[resume] loaded full transformer weights from {ckpt_dir}")
     else:
-        eval_sampler = (
-            DistributedSampler(eval_ds, num_replicas=world_size, rank=rank, shuffle=False)
-            if distributed else None
-        )
-        eval_loader = DataLoader(
-            eval_ds,
-            batch_size=eval_cfg.get("batch_size", train_cfg["batch_size"]),
-            sampler=eval_sampler,
-            shuffle=False,
-            num_workers=eval_cfg.get("num_workers", 2),
-            collate_fn=collate_video_mesh,
-            worker_init_fn=worker_init_fn,
-            drop_last=False,
-        )
+        raise FileNotFoundError(f"no transformer weights under {ckpt_dir}")
+
+    optimizer_path = os.path.join(ckpt_dir, "optimizer.pt")
+    if os.path.exists(optimizer_path):
+        opt_ckpt = torch.load(optimizer_path, map_location=device)
+        optimizer.load_state_dict(opt_ckpt["optimizer"])
+        step = int(opt_ckpt.get("step", 0))
+        if is_main_process():
+            logger.info(f"[resume] restored optimizer, global_step={step}")
+        return step
 
     if is_main_process():
-        logger.info(f"[video2mesh] train samples: {len(train_ds)}")
-        logger.info(f"[video2mesh] eval  samples: {len(eval_ds)}")
-
-    return train_loader, eval_loader
+        logger.warning(f"[resume] no optimizer.pt in {ckpt_dir}, global_step=0")
+    return 0
 
 
-# =========================================================
-# eval
-# =========================================================
-@torch.no_grad()
-def run_evaluation(
-    loader,
-    transformer,
-    device,
-    attention_design,
-    cfg,
-    writer=None,
-    epoch=None,
-    tag_prefix="test",
-):
-    if loader is None:
-        return {}
-
-    transformer.eval()
-
-    loss_cfg = cfg["train"]["loss"]
-    loss_sum = 0.0
-    sample_count = 0
-
-    tqdm_loader = (
-        tqdm(loader, total=len(loader), desc=f"Eval: {tag_prefix}", ncols=120)
-        if is_main_process() else loader
+def save_checkpoint(model, optimizer, output_dir, global_step):
+    base_model = model.module if hasattr(model, "module") else model
+    step_dir = os.path.join(output_dir, f"checkpoint_step_{global_step}")
+    os.makedirs(step_dir, exist_ok=True)
+    base_model.save_pretrained(step_dir)
+    torch.save(
+        {"optimizer": optimizer.state_dict(), "step": global_step},
+        os.path.join(step_dir, "optimizer.pt"),
     )
+    logger.info(f"[ckpt] saved step {global_step} -> {step_dir}")
+    return step_dir
 
-    cnt = 0
-    for batch in tqdm_loader:
-        cnt += 1
-        if cfg["runtime"]["debug"] and cnt >= 10:
-            break
 
-        latent = batch["latent"].to(device, non_blocking=True)
-        image_embed = batch["image_embed"].to(device, non_blocking=True)
+@torch.inference_mode()
+def merge_lora_to_full_weights_safely(
+    step_dir: str,
+    base_ckpt_dir: str,
+    save_subdir: str = "transformer",
+):
+    """CPU-merge LoRA adapter back into a clean base, save full weights."""
+    from peft import PeftModel
 
-        loss, _ = compute_flow_matching_loss(
-            transformer=transformer,
-            latent=latent,
-            image_embed=image_embed,
-            attention_kwargs=attention_design,
-            t_schedule=loss_cfg.get("t_schedule", "uniform"),
-            t_mean=loss_cfg.get("t_mean", 0.0),
-            t_std=loss_cfg.get("t_std", 1.0),
-            timestep_scale=loss_cfg.get("timestep_scale", 1000.0),
-            loss_type=loss_cfg.get("loss_type", "l2"),
-        )
+    cpu_base = TripoSGDiTModel4D.from_pretrained(
+        base_ckpt_dir, torch_dtype=torch.float32, device_map="cpu"
+    )
+    cpu_peft = PeftModel.from_pretrained(cpu_base, step_dir, is_trainable=False)
+    merged = cpu_peft.merge_and_unload()
+    out_dir = os.path.join(step_dir, save_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    merged.save_pretrained(out_dir)
+    logger.info(f"[merge] merged LoRA on CPU -> {out_dir}")
 
-        bs = latent.size(0)
-        loss_sum += float(loss.item()) * bs
-        sample_count += bs
 
-    sample_count = reduce_sum_scalar(sample_count, device)
-    loss_sum = reduce_sum_scalar(loss_sum, device) / max(sample_count, 1)
+def cleanup_old_step_ckpts(output_dir: str, max_ckpt: int):
+    if max_ckpt is None or max_ckpt <= 0:
+        return
+    if not os.path.isdir(output_dir):
+        return
+    entries = []
+    for name in os.listdir(output_dir):
+        m = re.match(r"checkpoint_step_(\d+)$", name)
+        if m:
+            entries.append((int(m.group(1)), os.path.join(output_dir, name)))
+    entries.sort()
+    to_delete = entries[: max(0, len(entries) - max_ckpt)]
+    import shutil
+    for step, path in to_delete:
+        try:
+            shutil.rmtree(path)
+            logger.info(f"[ckpt] removed old {path}")
+        except Exception as e:
+            logger.warning(f"[ckpt] failed to remove {path}: {e}")
 
+
+# =========================================================
+# LoRA helpers
+# =========================================================
+def build_lora_target_modules(model, lora_target_mode: str) -> List[str]:
+    """Pick LoRA target module names on the TripoSG DiT blocks."""
+    all_linear_names: List[str] = []
+    for name, module in model.named_modules():
+        is_linear = isinstance(module, torch.nn.Linear)
+        if LoRACompatibleLinear is not None and isinstance(module, LoRACompatibleLinear):
+            is_linear = True
+        if is_linear and "temporal_block" not in name:
+            all_linear_names.append(name)
+
+    final: List[str] = []
+    num_blocks = len(model.blocks)
+    for i in range(num_blocks):
+        for attn_idx in (1, 2):
+            q = f"blocks.{i}.attn{attn_idx}.to_q"
+            k = f"blocks.{i}.attn{attn_idx}.to_k"
+            v = f"blocks.{i}.attn{attn_idx}.to_v"
+            o = f"blocks.{i}.attn{attn_idx}.to_out.0"
+            if q in all_linear_names: final.append(q)
+            if k in all_linear_names: final.append(k)
+            if v in all_linear_names: final.append(v)
+            if lora_target_mode == "all" and o in all_linear_names:
+                final.append(o)
+        if lora_target_mode == "all":
+            ff1 = f"blocks.{i}.ff.net.0.proj"
+            ff2 = f"blocks.{i}.ff.net.2"
+            skip_linear = f"blocks.{i}.skip_linear"
+            if ff1 in all_linear_names: final.append(ff1)
+            if ff2 in all_linear_names: final.append(ff2)
+            if skip_linear in all_linear_names: final.append(skip_linear)
+
+    if lora_target_mode == "all":
+        for extra in ("time_proj.linear_1", "time_proj.linear_2", "proj_in", "proj_out"):
+            if extra in all_linear_names:
+                final.append(extra)
+    return final
+
+
+def wrap_with_lora(model, lora_cfg):
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    targets = build_lora_target_modules(model, lora_cfg.get("target_mode", "all"))
     if is_main_process():
-        logger.info(f"[{tag_prefix}] fm_loss={loss_sum:.6f}")
+        logger.info(f"[lora] target modules ({len(targets)}): {targets}")
 
-    if writer is not None and epoch is not None:
-        writer.add_scalar(f"{tag_prefix}/fm_loss", loss_sum, epoch)
-
-    return {"fm_loss": loss_sum}
+    cfg = LoraConfig(
+        r=lora_cfg.get("rank", 4),
+        lora_alpha=lora_cfg.get("alpha", lora_cfg.get("rank", 4)),
+        target_modules=targets,
+        lora_dropout=lora_cfg.get("dropout", 0.0),
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    model = get_peft_model(model, cfg)
+    if is_main_process():
+        model.print_trainable_parameters()
+    return model
 
 
 # =========================================================
@@ -291,7 +247,7 @@ def train_video2mesh(cfg):
     model_cfg = cfg["model"]
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
-    eval_cfg = cfg["eval"]
+    lora_cfg = cfg.get("lora", {"enable": False})
     output_cfg = cfg["output"]
 
     set_seed(runtime_cfg.get("seed", 42))
@@ -302,247 +258,258 @@ def train_video2mesh(cfg):
     if is_main_process():
         dump_yaml_config(cfg, os.path.join(base_dir, "config.yaml"))
 
-    logdir = os.path.join(base_dir, f"logs_{PROCESS_NAME}")
     if is_main_process():
-        logger.info(f"Log directory: {logdir}")
+        run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir = os.path.join(base_dir, "logs", f"run_{run_id}")
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
+        logger.info(f"TensorBoard log dir: {log_dir}")
+    else:
+        writer = None
 
     device_str = runtime_cfg.get("device", "cuda")
     if device_str == "cuda" and torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cpu")
-
-    attention_design = model_cfg["attention_kwargs"]
+    if is_main_process():
+        logger.info(f"device: {device}")
 
     # ---- data ----
-    train_loader, eval_loader = build_dataloaders(
-        data_cfg=data_cfg,
-        train_cfg=train_cfg,
-        eval_cfg=eval_cfg,
-        attention_design=attention_design,
-        distributed=distributed,
-        rank=rank,
-        world_size=world_size,
+    seq_len = int(data_cfg["seq_len"])
+    dataset = FullSequenceLatentDataset(
+        npz_dirs=data_cfg["train_dirs"],
+        seq_len=seq_len,
+        frame_step=data_cfg.get("frame_step", 1),
+        hop=data_cfg.get("hop", 1),
+        drop_last=data_cfg.get("drop_last", True),
+        preload=data_cfg.get("preload", False),
+        num_threads=data_cfg.get("num_threads", 32),
+        skip_json=data_cfg.get("skip_json"),
+    )
+    sampler = (
+        DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        if distributed else None
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=train_cfg["batch_size"],
+        shuffle=(sampler is None),
+        num_workers=train_cfg.get("num_workers", 4),
+        pin_memory=(device.type == "cuda"),
+        sampler=sampler,
+        drop_last=True,
     )
 
-    # ---- model (transformer only) ----
-    transformer: nn.Module = instantiate_from_config(model_cfg)
+    # ---- model ----
+    if is_main_process():
+        logger.info(f"loading transformer from {model_cfg['pretrained_path']}")
+    model = TripoSGDiTModel4D.from_pretrained(model_cfg["pretrained_path"])
 
-    if train_cfg.get("use_grad_checkpoint", False):
-        if hasattr(transformer, "enable_gradient_checkpointing"):
-            transformer.enable_gradient_checkpointing()
-        else:
-            transformer.gradient_checkpointing = True
+    if train_cfg.get("gradient_checkpointing", False):
+        model.gradient_checkpointing = True
+        if is_main_process():
+            logger.info("gradient checkpointing enabled")
 
-    pretrain_ckpt = train_cfg.get("pretrain_ckpt")
-    if pretrain_ckpt is not None:
-        load_partial_pretrain(transformer, pretrain_ckpt)
+    # ---- LoRA wrap (optional) ----
+    if lora_cfg.get("enable", False):
+        model = wrap_with_lora(model, lora_cfg)
 
-    transformer = transformer.to(device)
+    model.to(device)
 
+    # ---- optimizer ----
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad),
+        lr=train_cfg["learning_rate"],
+        betas=tuple(train_cfg.get("betas", (0.9, 0.999))),
+        weight_decay=train_cfg.get("weight_decay", 0.0),
+    )
+
+    global_step = 0
+    if train_cfg.get("resume", False):
+        global_step = auto_resume_and_load(
+            model, optimizer, base_dir, device, is_lora=lora_cfg.get("enable", False)
+        )
+
+    if is_main_process():
+        trainable_count = sum(1 for _, p in model.named_parameters() if p.requires_grad)
+        trainable_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"trainable param tensors: {trainable_count}")
+        logger.info(f"trainable param count:   {trainable_num:,}")
+
+    # ---- AMP ----
+    use_amp = train_cfg.get("use_amp", True) and device.type == "cuda"
+    amp_dtype_str = runtime_cfg.get("amp_dtype", "bfloat16")
+    amp_dtype = {
+        "float16": torch.float16, "fp16": torch.float16,
+        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+    }.get(amp_dtype_str, torch.bfloat16)
+    # GradScaler is only needed for fp16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+
+    # ---- scheduler ----
+    with open(train_cfg["scheduler_config_path"], "r") as f:
+        sched_config = json.load(f)
+    scheduler = RectifiedFlowScheduler(**sched_config)
+
+    # ---- DDP wrap ----
     if distributed:
-        transformer = torch.nn.parallel.DistributedDataParallel(
-            transformer,
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
             device_ids=[local_rank],
             output_device=local_rank,
             find_unused_parameters=train_cfg.get("find_unused_parameters", False),
         )
 
-    # ---- optimizer ----
-    lr = train_cfg["lr"]
-    weight_decay = train_cfg.get("weight_decay", 0.0)
-    betas = tuple(train_cfg.get("betas", (0.9, 0.999)))
-
-    if weight_decay == 0.0:
-        optimizer = optim.Adam(transformer.parameters(), lr=lr, betas=betas)
-    else:
-        optimizer = optim.AdamW(
-            transformer.parameters(), lr=lr, betas=betas, weight_decay=weight_decay
-        )
-
-    writer = SummaryWriter(logdir) if is_main_process() else None
+    # ---- attention design ----
+    attention_design = dict(model_cfg["attention_kwargs"])
+    attention_design["seq_len"] = seq_len
 
     if is_main_process():
-        total_params = sum(p.numel() for p in transformer.parameters())
-        trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-        logger.info("=" * 60)
-        logger.info(f"[{PROCESS_NAME}] total     params: {total_params:,}")
-        logger.info(f"[{PROCESS_NAME}] trainable params: {trainable:,}")
-        logger.info(f"[{PROCESS_NAME}] seq_len: {attention_design['seq_len']}")
-        logger.info(f"[{PROCESS_NAME}] loss cfg: {train_cfg['loss']}")
-        logger.info("=" * 60)
+        logger.info("***** training *****")
+        logger.info(f"  windows: {len(dataset)}")
+        logger.info(f"  epochs : {train_cfg['num_epochs']}")
+        logger.info(f"  bs/gpu : {train_cfg['batch_size']}")
+        logger.info(f"  accum  : {train_cfg.get('gradient_accumulation_steps', 1)}")
+        logger.info(f"  world  : {world_size}")
+        logger.info(f"  attn   : {attention_design}")
 
-    best_test_loss = float("inf")
-    best_ckpt_path = os.path.join(base_dir, f"{PROCESS_NAME}_ckpt_best.pt")
-    start_epoch = 0
-
-    ckpt_path_latest = find_latest_ckpt(base_dir, PROCESS_NAME)
-    if ckpt_path_latest and os.path.exists(ckpt_path_latest):
-        if is_main_process():
-            logger.info(f"Loading checkpoint: {ckpt_path_latest}")
-        start_epoch = load_checkpoint(
-            transformer.module if distributed else transformer,
-            optimizer,
-            ckpt_path_latest,
-            device,
-        )
-        if is_main_process():
-            logger.info(f"Resumed from epoch {start_epoch}")
-
-    amp_dtype_str = runtime_cfg.get("amp_dtype", "float16")
-    amp_dtype = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-    }.get(amp_dtype_str, torch.float16)
-    use_scaler = amp_dtype == torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
-
-    global_step = 0
-    epochs = train_cfg["epochs"]
-    grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
+    uncond_dropout_prob = train_cfg.get("uncond_dropout_prob", 0.1)
+    t_weighting = train_cfg.get("timestep_sampling_weighting", "logit_normal")
+    loss_weighting_scheme = train_cfg.get("loss_weighting_scheme", "sigma_sqrt")
+    logit_mean = train_cfg.get("logit_mean", 0.0)
+    logit_std = train_cfg.get("logit_std", 1.0)
+    grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
+    save_every = train_cfg.get("save_every", 0)
+    log_every = train_cfg.get("log_every", 10)
+    max_ckpt = train_cfg.get("max_ckpt", 0)
+    debug = runtime_cfg.get("debug", False)
 
-    for epoch in range(start_epoch, epochs):
-        if distributed and isinstance(train_loader.sampler, DistributedSampler):
-            train_loader.sampler.set_epoch(epoch)
+    model.train()
 
-        transformer.train()
-        running_loss = 0.0
-        seen_samples = 0
-        epoch_start_time = time.time()
+    try:
+        for epoch in range(train_cfg["num_epochs"]):
+            if distributed and sampler is not None:
+                sampler.set_epoch(epoch)
 
-        loader_tqdm = (
-            tqdm(
-                enumerate(train_loader),
-                total=len(train_loader),
-                desc=f"Epoch {epoch + 1}/{epochs} [train][rank{rank}]",
+            progress = tqdm(
+                dataloader,
+                desc=f"Epoch {epoch} (rank {rank})",
+                disable=not is_main_process(),
                 ncols=120,
             )
-            if is_main_process()
-            else enumerate(train_loader)
-        )
 
-        batch_times = []
-        optimizer.zero_grad(set_to_none=True)
+            step_in_epoch = 0
+            for batch in progress:
+                step_in_epoch += 1
+                if debug and step_in_epoch >= 10:
+                    break
 
-        cnt = 0
-        for i, batch in loader_tqdm:
-            cnt += 1
-            if cfg["runtime"]["debug"] and cnt >= 10:
-                break
-            batch_start_time = time.time()
+                image_feat, latent_gt = batch
+                image_feat = image_feat.to(device, non_blocking=True)
+                latent_gt = latent_gt.to(device, non_blocking=True)
+                B, frames = image_feat.shape[:2]
 
-            latent = batch["latent"].to(device, non_blocking=True)
-            image_embed = batch["image_embed"].to(device, non_blocking=True)
+                # CFG unconditional dropout (replace cond with zeros)
+                if uncond_dropout_prob > 0:
+                    uncond_mask = torch.rand(B, device=device) < uncond_dropout_prob
+                    if uncond_mask.any():
+                        image_feat[uncond_mask] = 0.0
 
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
-                raw_loss, loss_info = compute_flow_matching_loss(
-                    transformer=transformer,
-                    latent=latent,
-                    image_embed=image_embed,
-                    attention_kwargs=attention_design,
-                    t_schedule=train_cfg["loss"].get("t_schedule", "uniform"),
-                    t_mean=train_cfg["loss"].get("t_mean", 0.0),
-                    t_std=train_cfg["loss"].get("t_std", 1.0),
-                    timestep_scale=train_cfg["loss"].get("timestep_scale", 1000.0),
-                    loss_type=train_cfg["loss"].get("loss_type", "l2"),
+                # sample timesteps via density from the RF scheduler
+                t_sigmas = compute_density_for_timestep_sampling(
+                    weighting_scheme=t_weighting,
+                    batch_size=B,
+                    logit_mean=logit_mean,
+                    logit_std=logit_std,
+                ).to(device)
+                timesteps = scheduler._sigma_to_t(t_sigmas).long()
+
+                noise = torch.randn_like(latent_gt)
+                noisy_latent = scheduler.scale_noise(
+                    original_samples=latent_gt,
+                    noise=noise,
+                    timesteps=timesteps,
                 )
+                target_velocity = latent_gt - noise
 
-            loss = raw_loss / grad_accum_steps
-            if use_scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    model_output = model(
+                        hidden_states=noisy_latent,
+                        timestep=timesteps,
+                        encoder_hidden_states=image_feat,
+                        attention_kwargs=attention_design,
+                        return_dict=True,
+                    ).sample
 
-            if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_loader):
-                if use_scaler:
-                    scaler.unscale_(optimizer)
-                if max_grad_norm is not None and max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_grad_norm)
-                if use_scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
+                    loss = F.mse_loss(
+                        model_output.float(), target_velocity.float(), reduction="none"
+                    )
+                    loss_weights = compute_loss_weighting(
+                        loss_weighting_scheme, sigmas=t_sigmas
+                    )
+                    loss = (loss * loss_weights.view(B, 1, 1, 1)).mean()
+                    loss = loss / grad_accum
+
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
                 else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
 
-            bs = latent.size(0)
-            running_loss += raw_loss.item() * bs
-            seen_samples += bs
+                if (global_step + 1) % grad_accum == 0:
+                    if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
-            if writer is not None and global_step % 10 == 0:
-                writer.add_scalar("train/fm_loss", raw_loss.item(), global_step)
-                writer.add_scalar("train/u_mean", float(loss_info["u_mean"].item()), global_step)
-                writer.add_scalar("train/u_std", float(loss_info["u_std"].item()), global_step)
+                global_step += 1
 
-            global_step += 1
+                if is_main_process() and (global_step % log_every == 0):
+                    raw_loss_val = float(loss.item()) * grad_accum
+                    if writer is not None:
+                        writer.add_scalar("Loss/train", raw_loss_val, global_step)
+                        writer.add_scalar(
+                            "LR", optimizer.param_groups[0]["lr"], global_step
+                        )
+                    logger.info(
+                        f"step {global_step} epoch {epoch} loss={raw_loss_val:.4f} "
+                        f"lr={optimizer.param_groups[0]['lr']:.2e}"
+                    )
 
-            batch_time = time.time() - batch_start_time
-            batch_times.append(batch_time)
-            if is_main_process() and i % 10 == 0 and i > 0:
-                avg_batch = sum(batch_times) / len(batch_times)
-                remaining = avg_batch * (len(train_loader) - i - 1)
-                loader_tqdm.set_postfix_str(
-                    f"Loss={raw_loss.item():.4f} | ETA={remaining / 60:.1f}min"
-                )
+                should_save = (save_every > 0) and (global_step % save_every == 0)
+                if should_save and is_main_process():
+                    step_dir = save_checkpoint(model, optimizer, base_dir, global_step)
+                    if lora_cfg.get("enable", False) and lora_cfg.get("merge_on_save", True):
+                        merge_lora_to_full_weights_safely(
+                            step_dir=step_dir,
+                            base_ckpt_dir=model_cfg["pretrained_path"],
+                            save_subdir="transformer",
+                        )
+                    cleanup_old_step_ckpts(base_dir, max_ckpt)
+                if distributed and should_save:
+                    dist.barrier()
 
-        train_loss = running_loss / max(seen_samples, 1)
-        epoch_time = time.time() - epoch_start_time
+                if is_main_process():
+                    progress.set_postfix(
+                        loss=float(loss.item()) * grad_accum,
+                        lr=optimizer.param_groups[0]["lr"],
+                    )
 
         if is_main_process():
-            logger.info(
-                f"Epoch {epoch + 1}: train fm_loss={train_loss:.6f} | time {epoch_time:.1f}s"
-            )
-        if writer is not None:
-            writer.add_scalar("epoch/train_fm_loss", train_loss, epoch + 1)
+            save_checkpoint(model, optimizer, base_dir, global_step)
+            if writer is not None:
+                writer.close()
+            logger.info("training done.")
 
-        # -------- eval + checkpoint --------
-        if (epoch + 1) % train_cfg.get("test_every", 1) == 0 or (epoch + 1) == epochs:
-            eval_metrics = run_evaluation(
-                loader=eval_loader,
-                transformer=transformer,
-                device=device,
-                attention_design=attention_design,
-                cfg=cfg,
-                writer=writer,
-                epoch=epoch + 1,
-                tag_prefix="test",
-            )
-
-            if is_main_process():
-                save_checkpoint_with_epoch(
-                    transformer.module if distributed else transformer,
-                    PROCESS_NAME,
-                    optimizer,
-                    epoch + 1,
-                    base_dir,
-                )
-                cleanup_old_checkpoints(base_dir, PROCESS_NAME, train_cfg.get("max_ckpt", 5))
-
-                best_metric_name = eval_cfg.get("best_metric_name", "fm_loss")
-                score = eval_metrics.get(best_metric_name, train_loss)
-                if score < best_test_loss:
-                    best_test_loss = score
-                    torch.save(
-                        {
-                            "model_state": (transformer.module if distributed else transformer).state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "epoch": epoch + 1,
-                            "best_test_loss": best_test_loss,
-                            "eval_metrics": eval_metrics,
-                        },
-                        best_ckpt_path,
-                    )
-                    logger.info(
-                        f"New best checkpoint saved: {best_ckpt_path} "
-                        f"({best_metric_name}={best_test_loss:.6f})"
-                    )
-
-    if writer is not None:
-        writer.close()
-    cleanup_distributed()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
