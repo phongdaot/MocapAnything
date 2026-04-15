@@ -134,11 +134,12 @@ def run_evaluation(
 
                         try:
                             plot_pose_compare_from_npy(
-                                npy_pred_path,
-                                npy_gt_path,
-                                species_name,
-                                vis_save_dir,
+                                pred_npy_path=npy_pred_path,
+                                gt_npy_path=npy_gt_path,
+                                species_name=species_name,
+                                save_dir=vis_save_dir,
                                 fps=15,
+                                bvh_roots=[cfg['data']['bvh_dir']],
                             )
                         except Exception as e:
                             logger.warning(f"[VIS-{tag_prefix}] Fail: {species_name}: {e}")
