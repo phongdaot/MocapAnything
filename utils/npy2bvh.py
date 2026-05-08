@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 from .transforms3d import rotation_6d_to_matrix, matrix_to_euler_angles
-from animatrix.data.structure import bvh as BVH
+import .bvh as BVH
 import os
 import sys, subprocess
 import argparse

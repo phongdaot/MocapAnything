@@ -5,7 +5,7 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import animatrix.data.structure.bvh as BVH
+import .bvh as BVH
 from animatrix.data.visualizer.skeleton_visualizer import parent_to_kinematic_tree
 
 

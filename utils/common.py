@@ -6,7 +6,7 @@ import os
 import torch
 import trimesh
 from PIL import Image
-import animatrix.data.structure.bvh as BVH
+import .bvh as BVH
 from animatrix.data.visualizer.skeleton_visualizer import parent_to_kinematic_tree
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
@@ -14,7 +14,7 @@ from preprocess.image_process import prepare_image
 from .finder import *
 from .npy2bvh import convert_npy_to_bvh
 from .rotation import rot6d_to_fk_positions, bvh_to_joints_rot, rot6d_to_rotmat_batch
-from animatrix.data.utils.mesh import batch_rigid_transform
+from .mesh import batch_rigid_transform
 
 def apply_joint_mask(pred_rot6d, gt_rot6d, mask):
     """
