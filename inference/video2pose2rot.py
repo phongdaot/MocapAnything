@@ -14,7 +14,7 @@ from utils.npy2bvh import convert_npy_to_bvh
 from utils.config_utils import load_yaml_config, instantiate_from_config
 from preprocess.briarmbg import BriaRMBG
 from TripoSG.triposg.pipelines.pipeline_triposg import TripoSGPipeline
-from animatrix.data.transform.fileio import BVHReader
+from utils.bvh_reader import BVHReader
 from utils.mesh import blender_visualize_character_motion
 
 MAX_JOINTS=150

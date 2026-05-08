@@ -187,8 +187,6 @@ def main():
         print(folder)
         if not os.path.isdir(folder):
             continue
-
-        if folder != "datasets/selected_nbg_wild/Alligator#Alligator_Act1": continue
         print(f"Processing folder: {folder}")
         for fname in os.listdir(folder):
             ext = os.path.splitext(fname)[1].lower()

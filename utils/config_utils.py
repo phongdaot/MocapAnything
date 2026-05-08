@@ -3,6 +3,12 @@ import importlib
 import yaml
 import os
 from .dist_utils import is_main_process
+
+def load_json(pth):
+    with open(pth, 'r') as file:
+        data_dict = json.load(file)
+    return data_dict
+
 def load_yaml_config(path):
 
     with open(path, "r") as f:

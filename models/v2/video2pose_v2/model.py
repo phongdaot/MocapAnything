@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 from .attention_blocks import *
-
+from .attention_processors import *
 
 class Video2PoseModelSliding(nn.Module):
     def __init__(self, num_layers=4, q_dim=256, img_dim=1024, num_joints=52, num_heads=8,

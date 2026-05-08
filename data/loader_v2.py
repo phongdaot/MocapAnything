@@ -12,7 +12,7 @@ import numpy as np
 import time
 from utils.dist_utils import is_main_process
 from utils.logger import logger
-from animatrix.data.transform.fileio import BVHReader
+from utils.bvhreader import BVHReader
 
 MAX_JOINTS=150
 # ============================================================
