@@ -179,7 +179,7 @@ class Animation:
         self.positions = self.offsets[None, :, :].repeat(frame_cnt, axis=0)
         self.positions[:, 0] = global_positions[:, 0]
 
-        # from animatrix.data.structure import bvh as BVH
+        # import utils.bvh as BVH
         # BVH.save(save_name, self, frametime=1.0 / 30.0)
         # pass
 

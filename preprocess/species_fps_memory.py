@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import .bvh as BVH
-from animatrix.data.visualizer.skeleton_visualizer import parent_to_kinematic_tree
+from utils.common import parent_to_kinematic_tree
 
 
 # =========================================================
