@@ -6,7 +6,7 @@ import subprocess
 from typing import Tuple, Optional
 import numpy as np
 from .rotation import quaternion_to_axis_angle
-import animatrix.data.structure.bvh as BVH
+import .bvh as BVH
 from animatrix.data.visualizer.single_mesh_visualizer import interchange_y_z_axis, sm_loop, rotate_mesh_sequence_y_axis, rot_y
 from animatrix.data.utils.bvh_tools import get_diameter
 import trimesh

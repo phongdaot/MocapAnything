@@ -1,8 +1,8 @@
 ### rotation.py ###
 from .transforms3d import rotation_6d_to_matrix, matrix_to_euler_angles
-from animatrix.data.utils.mesh import extract_mesh_from_bvh
-from animatrix.data.structure import bvh as BVH
-import animatrix.data.structure.animation as animation
+from .mesh import extract_mesh_from_bvh
+import .bvh as BVH
+import .animation as animation
 
 import torch
 import numpy as np
