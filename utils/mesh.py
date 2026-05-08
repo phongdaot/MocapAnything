@@ -5,9 +5,8 @@ import shutil
 import subprocess
 from typing import Tuple, Optional
 import numpy as np
-from animatrix.data.utils.transforms3d import quaternion_to_axis_angle
+from .rotation import quaternion_to_axis_angle
 import animatrix.data.structure.bvh as BVH
-from animatrix.data.utils.mesh import compute_rest_joints, lbs
 from animatrix.data.visualizer.single_mesh_visualizer import interchange_y_z_axis, sm_loop, rotate_mesh_sequence_y_axis, rot_y
 from animatrix.data.utils.bvh_tools import get_diameter
 import trimesh
@@ -18,6 +17,138 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Literal
 from utils.visualization import add_background_to_image_folder, convert_images_to_video
+
+def compute_rest_joints(offsets: np.ndarray, parents: np.ndarray) -> np.ndarray:
+    """
+    Compute global joint positions in T-pose from BVH offsets and parent structure.
+
+    Args:
+        offsets (np.ndarray): Local offsets of each joint in BVH hierarchy.
+        parents (np.ndarray): Parent indices for each joint.
+
+    Returns:
+        np.ndarray: Global joint positions in rest (T) pose.
+    """
+    J = offsets.shape[0]
+    joints = np.zeros((J, 3))
+    for j in range(J):
+        if parents[j] < 0:
+            joints[j] = offsets[j]
+        else:
+            joints[j] = joints[parents[j]] + offsets[j]
+    return joints
+
+def lbs(
+    pose: torch.Tensor,
+    v_template: torch.Tensor,
+    rest_joints: torch.Tensor,
+    parents: torch.Tensor,
+    lbs_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perform Linear Blend Skinning with the given pose and rest parameters.
+
+    Args:
+        pose (torch.Tensor): (B, (J+1)*3) Pose parameters in axis-angle format.
+        v_template (torch.Tensor): (V, 3) Template mesh vertices.
+        rest_joints (torch.Tensor): (B, J+1, 3) Rest pose global joint positions.
+        parents (torch.Tensor): (J,) Parent joint indices.
+        lbs_weights (torch.Tensor): (V, J+1) Skinning weights.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - verts (B, V, 3): Deformed mesh vertices.
+            - joints (B, J+1, 3): Transformed joint locations.
+    """
+    batch_size = pose.shape[0]
+    device, dtype = pose.device, pose.dtype
+
+    # Get the joints
+    # NxJx3 array
+    J = rest_joints
+    rot_mats = axis_angle_to_matrix(pose).view([batch_size, -1, 3, 3])
+    v_posed = v_template.repeat(batch_size, 1, 1)
+
+    # Get the global joint location
+    J_transformed, A = batch_rigid_transform(rot_mats, J, parents)
+
+    # Do skinning:
+    # W is N x V x (J + 1)
+    W = lbs_weights.unsqueeze(dim=0).expand([batch_size, -1, -1])
+    # (N x V x (J + 1)) x (N x (J + 1) x 16)
+    num_joints = J.shape[1]
+    T = torch.matmul(W, A.view(batch_size, num_joints, 16)) \
+        .view(batch_size, -1, 4, 4)
+
+    homogen_coord = torch.ones(
+        [batch_size, v_posed.shape[1], 1], dtype=dtype, device=device
+    )
+    v_posed_homo = torch.cat([v_posed, homogen_coord], dim=2)
+    v_homo = torch.matmul(T, torch.unsqueeze(v_posed_homo, dim=-1))
+
+    verts = v_homo[:, :, :3, 0]
+    return verts, J_transformed
+
+def transform_mat(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """
+    Create homogeneous transformation matrices from rotation and translation.
+
+    Args:
+        R (torch.Tensor): (B, 3, 3) Rotation matrices.
+        t (torch.Tensor): (B, 3, 1) Translation vectors.
+    """
+    return torch.cat(
+        [F.pad(R, [0, 0, 0, 1]),
+         F.pad(t, [0, 0, 0, 1], value=1)], dim=2
+    )
+
+
+def batch_rigid_transform(
+    rot_mats: torch.Tensor,
+    joints: torch.Tensor,
+    parents: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rigid body transformations down a kinematic tree.
+
+    Args:
+        rot_mats (torch.Tensor): (B, J, 3, 3) Rotation matrices for each joint.
+        joints (torch.Tensor): (B, J, 3) Joint positions.
+        parents (torch.Tensor): (J,) Parent joint indices.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - posed_joints (B, J, 3): Transformed joints.
+            - rel_transforms (B, J, 4, 4): Relative transform matrices.
+    """
+    joints = torch.unsqueeze(joints, dim=-1)
+    rel_joints = joints.clone()
+    rel_joints[:, 1:] -= joints[:, parents[1:]]
+
+    transforms_mat = transform_mat(
+        rot_mats.reshape(-1, 3, 3), rel_joints.reshape(-1, 3, 1)
+    ).reshape(-1, joints.shape[1], 4, 4)
+
+    transform_chain = [transforms_mat[:, 0]]
+    for i in range(1, parents.shape[0]):
+        # Subtract the joint location at the rest pose
+        # No need for rotation, since it's identity when at rest
+        curr_res = torch.matmul(
+            transform_chain[parents[i]], transforms_mat[:, i]
+        )
+        transform_chain.append(curr_res)
+
+    transforms = torch.stack(transform_chain, dim=1)
+
+    # The last column of the transformations contains the posed joints
+    posed_joints = transforms[:, :, :3, 3]
+
+    joints_homogen = F.pad(joints, [0, 0, 0, 1])
+    rel_transforms = transforms - F.pad(
+        torch.matmul(transforms, joints_homogen), [3, 0, 0, 0, 0, 0, 0, 0]
+    )
+
+    return posed_joints, rel_transforms
 
 def read_obj_mesh(
     file_path: str,
