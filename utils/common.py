@@ -15,6 +15,122 @@ from .npy2bvh import convert_npy_to_bvh
 from .rotation import rot6d_to_fk_positions, bvh_to_joints_rot, rot6d_to_rotmat_batch
 from .mesh import batch_rigid_transform
 
+def get_diameter(parents, bone_length):
+    """
+    Compute the longest path (tree diameter) in a skeleton tree.
+
+    Args:
+        parents (list[int]): Parent index list for each joint (-1 for root).
+        bone_length (list[float]): Bone lengths for each joint.
+
+    Returns:
+        tuple:
+            - float: Total length of the longest path.
+            - list[int]: Joint indices along the longest path.
+    """
+    tree = [
+        {
+            'bone_length': l,
+            'parent': None,
+            'children': [],
+            'explored': False
+        } for l in bone_length
+    ]
+    for i, p, in enumerate(parents):
+        node = tree[i]
+        if p != -1:
+            node['parent'] = p
+            tree[p]['children'].append(i)
+
+    # return tree
+    def get_one_end(idx, path=[], length=0.):
+        node = tree[idx]
+        cur_length = length + node['bone_length']
+        path.append(idx)
+        node['explored'] = True
+
+        if node['parent']:
+            candidate = [
+                i for i in node['children'] + [node['parent']]
+                if not tree[i]['explored']
+            ]
+        else:
+            candidate = [i for i in node['children'] if not tree[i]['explored']]
+
+        if not candidate:
+            return cur_length, path
+
+        m_length = cur_length
+        m_path = path[:]
+        for c in candidate:
+            c_length, c_path = get_one_end(c, path[:], cur_length)
+            if c_length >= m_length:
+                m_length = c_length
+                m_path = c_path
+
+        return m_length, m_path
+
+    a_l, a_p = get_one_end(0)
+    for node in tree:
+        node['explored'] = False
+
+    b_l, b_p = get_one_end(a_p[-1], [])
+    return b_l, b_p
+
+def smoothing(x, smooth=0.99):
+    """
+    Apply exponential moving average smoothing to a 1D array.
+
+    Args:
+        x (np.ndarray): Input 1D array.
+        smooth (float): Smoothing factor.
+    """
+    x = x.copy()
+    weight = smooth
+    for i in range(1, len(x)):
+        x[i] = (x[i - 1] * weight + x[i]) / (weight + 1)
+        weight = (weight + 1) * smooth
+    return x
+
+
+def sm_loop(frame_arr, sm=0.99):
+    """
+    Apply smoothing to each column of a 2D array (frames x dimension).
+
+    Args:
+        frame_arr (np.ndarray): Input 2D array.
+        sm (float): Smoothing factor.
+    """
+    sm_res = np.zeros(frame_arr.shape)
+    for i in range(frame_arr.shape[1]):
+        sm_res[:, i] = smoothing(frame_arr[:, i], sm)
+    return sm_res
+
+
+def interchange_y_z_axis(array: np.array) -> np.array:
+    """
+    Interchanges the Y and Z axes of a NumPy array.
+
+    Args:
+        array (np.array): The input NumPy array with shape (..., 3),
+                          where the last dimension represents (x, y, z) coordinates.
+
+    Returns:
+        np.array: The NumPy array with Y and Z axes interchanged, with the same shape as the input array.
+    """
+    array_xyz = array.copy()
+    array_xzy = array.copy()
+    array_xzy[..., 2] = array_xyz[..., 1]
+    array_xzy[..., 1] = array_xyz[..., 2]
+    return array_xzy
+
+def rot_y(deg: float):
+    rad = math.radians(deg)
+    c, s = math.cos(rad), math.sin(rad)
+    return np.array(
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float32
+    )
+
 def parent_to_kinematic_tree(parents: list):
 
     dfs_len = len(parents)

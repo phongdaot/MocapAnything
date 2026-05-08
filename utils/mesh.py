@@ -7,8 +7,6 @@ from typing import Tuple, Optional
 import numpy as np
 from .rotation import quaternion_to_axis_angle
 import .bvh as BVH
-from animatrix.data.visualizer.single_mesh_visualizer import interchange_y_z_axis, sm_loop, rotate_mesh_sequence_y_axis, rot_y
-from animatrix.data.utils.bvh_tools import get_diameter
 import trimesh
 from tqdm import tqdm
 import os
@@ -17,6 +15,67 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Literal
 from utils.visualization import add_background_to_image_folder, convert_images_to_video
+from .common import get_diameter, sm_loop, interchange_y_z_axis, rot_y
+
+def rotate_mesh_sequence_y_axis(
+    vertices: np.ndarray,
+    angles: float | np.ndarray,
+    faces: np.ndarray,
+    root_positions: np.ndarray = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Rotate a mesh sequence around each frame's root position along the Y axis,
+    and compute per-vertex normals after rotation.
+
+    Args:
+        vertices (np.ndarray): Mesh vertices of shape (F, N, 3).
+        root_positions (np.ndarray): Root positions of shape (F, 3).
+        angles (float or np.ndarray): Rotation angles in degrees.
+            Can be a single float or an array of shape (F,).
+        faces (np.ndarray): Face indices of shape (T, 3), shared across frames.
+
+    Returns:
+        tuple:
+            - np.ndarray: Rotated mesh sequence of shape (F, N, 3).
+            - np.ndarray: Per-frame vertex normals of shape (F, N, 3).
+    """
+    F, N, _ = vertices.shape
+    if isinstance(angles, (float, int)):
+        angles = np.full((F,), angles)
+    else:
+        angles = np.asarray(angles)
+        assert angles.shape == (F,), "angles must be a float or shape (F,)"
+
+    # Create batched rotation matrices
+    rot = R.from_euler('y', angles, degrees=True)
+    rot_matrices = rot.as_matrix()  # (F, 3, 3)
+
+    # Rotate mesh
+    if root_positions:
+        assert root_positions.shape == (F, 3), "root_positions must be (F, 3)"
+        centered = vertices - root_positions[:, None, :]  # (F, N, 3)
+        rotated = rot_matrices @ centered.transpose(0, 2, 1)  # (F, 3, N)
+        rotated = rotated.transpose(0, 2, 1)  # (F, N, 3)
+        rotated += root_positions[:, None, :]  # (F, N, 3s)
+    else:
+        rotated = rot_matrices @ vertices.transpose(0, 2, 1)
+        rotated = rotated.transpose(0, 2, 1)
+
+    # Compute normals
+    normals = np.zeros_like(rotated)  # (F, N, 3)
+    v0 = rotated[:, faces[:, 0]]  # (F, T, 3)
+    v1 = rotated[:, faces[:, 1]]
+    v2 = rotated[:, faces[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0)  # (F, T, 3)
+
+    for f in range(F):
+        for i in range(3):
+            np.add.at(normals[f], faces[:, i], face_normals[f])
+
+    norm = np.linalg.norm(normals, axis=2, keepdims=True) + 1e-8
+    normals /= norm  # (F, N, 3)
+
+    return rotated, normals
 
 def compute_rest_joints(offsets: np.ndarray, parents: np.ndarray) -> np.ndarray:
     """
