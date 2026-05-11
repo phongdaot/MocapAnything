@@ -15,9 +15,6 @@ from mmengine.runner.checkpoint import load_checkpoint as mm_load_checkpoint
 from utils.logger import logger
 from utils.dist_utils import cleanup_distributed, is_main_process
 
-from animatrix.data.transform.fileio import BVHReader
-from animatrix.registry import build_model
-
 MAX_JOINTS=150
 
 # ============================================================

@@ -1,9 +1,8 @@
 ### npy2bvh.py ###
 import numpy as np
 import torch
-from animatrix.data.utils.transforms3d import rotation_6d_to_matrix, matrix_to_euler_angles
-from animatrix.data.utils.mesh import extract_mesh_from_bvh
-from animatrix.data.structure import bvh as BVH
+from .transforms3d import rotation_6d_to_matrix, matrix_to_euler_angles
+from . import bvh as BVH
 import os
 import sys, subprocess
 import argparse

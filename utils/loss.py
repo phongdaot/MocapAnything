@@ -3,10 +3,18 @@ import torch
 from typing import Callable, Dict, Any
 from .common import apply_joint_mask
 from .rotation import rot6d_to_fk_positions, rot6d_to_rotmat_batch
-from animatrix.evaluation.evaluator.reconstruction_evaluator import comp_geodesic
 from scipy.spatial.transform import Rotation as R
 import numpy as np
 import torch.nn as nn
+import roma
+
+def comp_geodesic(opt_mat: torch.Tensor, gt_mat: torch.Tensor):
+    geodesic = roma.rotmat_geodesic_distance(
+        opt_mat, gt_mat
+    ).mean(-1) * 180 / np.pi  # in degrees
+    geodesic = geodesic.reshape(len(geodesic), -1)
+    geodesic = torch.mean(geodesic, dim=-1)
+    return geodesic
 
 def angle_L1(pred_rot6d, gt_rot6d, mask=None):
     # L1 mean angle error (degree)
