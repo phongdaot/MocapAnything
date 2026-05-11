@@ -3,8 +3,8 @@ import random
 import numpy as np
 import torch
 
-import .animation as animation
-import .bvh as bvh
+from . import animation as animation
+from . import bvh as bvh
 from .common import get_diameter
 from .transforms3d import matrix_to_rotation_6d, quaternion_to_matrix
 from .config_utils import load_json

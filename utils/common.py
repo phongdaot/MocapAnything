@@ -6,14 +6,13 @@ import os
 import torch
 import trimesh
 from PIL import Image
-import .bvh as BVH
+from . import bvh as BVH
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 from preprocess.image_process import prepare_image
 from .finder import *
 from .npy2bvh import convert_npy_to_bvh
-from .rotation import rot6d_to_fk_positions, bvh_to_joints_rot, rot6d_to_rotmat_batch
-from .mesh import batch_rigid_transform
+import math
 
 def get_diameter(parents, bone_length):
     """

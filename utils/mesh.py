@@ -5,8 +5,8 @@ import shutil
 import subprocess
 from typing import Tuple, Optional
 import numpy as np
-from .rotation import quaternion_to_axis_angle
-import .bvh as BVH
+from .transforms3d import quaternion_to_axis_angle
+from . import bvh as BVH
 import trimesh
 from tqdm import tqdm
 import os
@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from typing import Literal
 from utils.visualization import add_background_to_image_folder, convert_images_to_video
 from .common import get_diameter, sm_loop, interchange_y_z_axis, rot_y
+from .transforms3d import axis_angle_to_matrix
 
 def rotate_mesh_sequence_y_axis(
     vertices: np.ndarray,

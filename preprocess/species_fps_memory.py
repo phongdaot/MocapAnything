@@ -5,7 +5,7 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import .bvh as BVH
+from . import bvh as BVH
 from utils.common import parent_to_kinematic_tree
 
 

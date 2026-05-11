@@ -8,7 +8,7 @@ from utils.finder import get_image_seq_relpath
 from PIL import Image
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
-import .bvh as BVH
+from . import bvh as BVH
 from .common import parent_to_kinematic_tree
 import shutil
 
