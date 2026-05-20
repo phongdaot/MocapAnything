@@ -15,7 +15,7 @@ from utils.transforms3d import (
     matrix_to_euler_angles
 )
 
-# 旋转配置（Y轴旋转）
+# Y-axis rotations in degrees, paired with output filenames below.
 rotations = [
     [0,   0, 0], [0,  15, 0], [0,  30, 0], [0,  45, 0],
     [0,  60, 0], [0,  75, 0], [0,  90, 0], [0, 135, 0],

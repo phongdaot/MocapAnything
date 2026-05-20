@@ -32,7 +32,7 @@ def get_kinematic_tree(
     bvh_path = get_species_bvh_path(species_name, zoo_root=zoo_root)
 
     if bvh_path is None:
-        print(f"[WARN] 找不到 {species_name} 的 BVH 文件，使用连续连接方式。")
+        print(f"[WARN] No BVH file found for {species_name}; falling back to sequential connectivity.")
         ktree = [[i, i + 1] for i in range(joint_num - 1)]
         return ktree, None
 
@@ -41,10 +41,10 @@ def get_kinematic_tree(
     ktree = [chain for chain in ktree if np.all(np.array(chain) < joint_num)]
 
     if len(ktree) == 0:
-        print(f"[WARN] BVH链与关节数不匹配，使用连续连接方式。")
+        print(f"[WARN] BVH kinematic chain does not match joint count; falling back to sequential connectivity.")
         ktree = [[i, i + 1] for i in range(joint_num - 1)]
 
-    print(f"[INFO] 使用骨架结构: {bvh_path}, joint_num={joint_num}, 有效骨架链数={len(ktree)}")
+    print(f"[INFO] Using skeleton: {bvh_path}, joint_num={joint_num}, valid_chains={len(ktree)}")
     return ktree, bvh_path
 
 
@@ -104,13 +104,13 @@ def plot_pose_grid_4x8(
     zoo_root="/home/ma-user/work/g00826954/projects/proj_4d/TripoSG/dataset/zoo1030/bvh",
 ):
     """
-    固定画成 4x8 grid
+    Plot up to 32 poses in a fixed 4x8 grid.
     poses: (N, J, 3), N <= 32
     """
     assert poses.ndim == 3 and poses.shape[-1] == 3, f"poses should be (N,J,3), got {poses.shape}"
 
     N, J, _ = poses.shape
-    assert N <= 32, f"当前函数固定最多画32张，got N={N}"
+    assert N <= 32, f"this function plots at most 32 panels, got N={N}"
 
     ktree, bvh_path = get_kinematic_tree(species_name, J, zoo_root=zoo_root)
 
@@ -255,7 +255,8 @@ def load_species_all_frames(npz_files, global_scale, downsample=1):
 def farthest_point_sampling(feat_flat, n_select, start_idx=0):
     """
     feat_flat: (N, D)
-    每轮选到当前已选集合最近距离最大的点
+    Each round picks the point whose nearest-neighbor distance to the
+    already-selected set is the largest.
     """
     N = feat_flat.shape[0]
     n_select = min(n_select, N)
@@ -282,8 +283,8 @@ def farthest_point_sampling(feat_flat, n_select, start_idx=0):
 # =========================================================
 def list_all_species_from_bvh_pose_root(bvh_pose_root):
     """
-    从 bvh_pose_root 下的子目录名里提取所有 species_name
-    例如:
+    Extract every species_name from the subdirectory names under bvh_pose_root.
+    For example:
       Tyranno#001  -> Tyranno
       Raptor#abc   -> Raptor
     """
@@ -332,7 +333,7 @@ def save_single_mode_result(
 
     pkl:
       ./debug_species_fps_memory/fps_select_by_{mode}_32.pkl
-      一个 mode 一个总 pkl，里面包含多个 species key
+      One aggregate pkl per mode, keyed by species.
 
     png:
       ./debug_species_fps_memory/images/{species}_fps_select_by_{mode}_32.png
@@ -396,12 +397,12 @@ def select_species_fps_memory(
     both_pose_weight=1.0,
 ):
     """
-    三种FPS:
+    Three FPS variants:
       1) by_rot  : rot_flat
       2) by_pose : pose_flat.reshape(N, J*3)
       3) by_both : concat(rot_flat, both_pose_weight * pose_flat_flat)
     """
-    assert n_select == 32, f"当前按你的要求固定 32, got {n_select}"
+    assert n_select == 32, f"n_select is hard-pinned to 32, got {n_select}"
 
     global_scale, _ = load_species_scale(scale_cache_path, species_name)
     _, npz_files = find_species_npz_files(bvh_pose_root, species_name)
@@ -497,7 +498,7 @@ def select_all_species_fps_memory(
     both_pose_weight=1.0,
     reset_existing_pkl=True,
 ):
-    assert n_select == 32, f"当前按你的要求固定 32, got {n_select}"
+    assert n_select == 32, f"n_select is hard-pinned to 32, got {n_select}"
 
     species_list = list_all_species_from_bvh_pose_root(bvh_pose_root)
     assert len(species_list) > 0, f"No species found in {bvh_pose_root}"

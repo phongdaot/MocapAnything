@@ -1,10 +1,59 @@
-from . import bvh as BVH
-from . import animation as animation
-from .transforms3d import *
-from .quaternion import *
-import torch
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import torch
+
+from . import animation as animation
+from . import bvh as BVH
+from .transforms3d import *
+
+
+# ---------------------------------------------------------------------------
+# Vendored numpy quaternion helpers (Hamilton convention, (w, x, y, z))
+# ---------------------------------------------------------------------------
+def qmul_np(q0, q1):
+    """Hamilton product of two quaternions. Inputs broadcast as numpy arrays;
+    the last axis must be 4 in (w, x, y, z) order."""
+    w0, x0, y0, z0 = q0[..., 0], q0[..., 1], q0[..., 2], q0[..., 3]
+    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    w = w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1
+    x = w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1
+    y = w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1
+    z = w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1
+    return np.stack([w, x, y, z], axis=-1)
+
+
+def qrot_np(q, v):
+    """Rotate 3D vector v by unit quaternion q. q is (..., 4) (w, x, y, z),
+    v is (..., 3); q broadcasts against v on all but the last axis."""
+    s = q[..., 0:1]
+    r = q[..., 1:]
+    cross1 = np.cross(r, v)
+    return v + 2.0 * (s * cross1 + np.cross(r, cross1))
+
+
+def qbetween_np(v0, v1):
+    """Quaternion that rotates 3-vector v0 onto v1 (single vectors)."""
+    v0 = np.asarray(v0, dtype=np.float64)
+    v1 = np.asarray(v1, dtype=np.float64)
+    n0 = np.linalg.norm(v0)
+    n1 = np.linalg.norm(v1)
+    if n0 < 1e-12 or n1 < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    v0n = v0 / n0
+    v1n = v1 / n1
+    dot = float(np.dot(v0n, v1n))
+    if dot > 1.0 - 1e-8:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    if dot < -1.0 + 1e-8:
+        axis = np.cross(v0n, np.array([1.0, 0.0, 0.0]))
+        if np.linalg.norm(axis) < 1e-8:
+            axis = np.cross(v0n, np.array([0.0, 1.0, 0.0]))
+        axis /= np.linalg.norm(axis)
+        return np.array([0.0, axis[0], axis[1], axis[2]])
+    s = float(np.sqrt((1.0 + dot) * 2.0))
+    axis = np.cross(v0n, v1n) / s
+    return np.array([s / 2.0, axis[0], axis[1], axis[2]])
 
 
 def face_forward_bvh_with_scale(
@@ -263,27 +312,26 @@ def get_diameter(parents, bone_length):
     b_l, b_p = get_one_end(a_p[-1], [])
     return b_l, b_p
 
-import sys
-import os
+
 if __name__ == '__main__':
+    import argparse
+    import os
 
-    def batch_scale_bvh(src_dir, dst_dir, scale=100.0):
-        os.makedirs(dst_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(
+        description="Batch face-forward + rescale every BVH in a directory."
+    )
+    parser.add_argument("--src", required=True, help="folder of input .bvh files")
+    parser.add_argument("--dst", required=True, help="folder to write rescaled .bvh files")
+    parser.add_argument("--scale", type=float, default=100.0)
+    args = parser.parse_args()
 
-        for filename in os.listdir(src_dir):
-            if filename.lower().endswith(".bvh"):
-                src = os.path.join(src_dir, filename)
-                dst = os.path.join(dst_dir, filename)
-
-                print(f"Scaling {src} → {dst}")
-                # scale_bvh(src, dst, scale)
-                anim, joint_names, frametime = BVH.load(src)
-                face_forward_bvh_with_scale(dst, anim, joint_names, frametime, scale)
-
-        print("Done. All BVH files processed.")
-
-
-    src = '/data01/xmx/projects/multimodal-motion-generation/data/datasets/bvh_motion_v1.2/demo/transfer_results/keji_all/hml3d_split2'
-    dst = '/data01/xmx/datasets/wzy_remesh/tmp_results/scaled'
-
-    batch_scale_bvh(src, dst, scale=100.0)
+    os.makedirs(args.dst, exist_ok=True)
+    for filename in os.listdir(args.src):
+        if not filename.lower().endswith(".bvh"):
+            continue
+        src = os.path.join(args.src, filename)
+        dst = os.path.join(args.dst, filename)
+        print(f"Scaling {src} -> {dst}")
+        anim, joint_names, frametime = BVH.load(src)
+        face_forward_bvh_with_scale(dst, anim, joint_names, frametime, args.scale)
+    print("Done. All BVH files processed.")
