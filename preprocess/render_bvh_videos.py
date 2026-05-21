@@ -1,16 +1,13 @@
 import os
 import sys
+import shutil
 from glob import glob
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 from utils.mesh import blender_visualize_character_motion
 
-
 character_folder = 'zoo/characters_fix_facezplus'
-blender_pth = '/home/ma-user/work/g00826954/projects/proj_4d/TripoSG/dataset/blender-3.6.14-linux-x64/blender'
+blender_pth = '/path/to/blender'
 hdri_pth = 'transparent'
-
 bvh_list = sorted(glob('zoo/bvh/*/*.bvh'))
 
 for motion_pth in bvh_list:
@@ -31,3 +28,12 @@ for motion_pth in bvh_list:
         camera_trace=False,
         fps=30,
     )
+
+    # Clean up everything except .mp4 files
+    if os.path.isdir(out_dir):
+        for name in os.listdir(out_dir):
+            p = os.path.join(out_dir, name)
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            elif not name.endswith('.mp4'):
+                os.remove(p)
