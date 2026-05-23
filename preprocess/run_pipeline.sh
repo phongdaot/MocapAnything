@@ -15,10 +15,17 @@
 #  10. preprocess_data : VAE + DINOv2 encode -> npz_train (GPU)
 #  11. image_only      : strip latent -> npz_train_image_only
 #
+# Mesh-free alternative (skips stages 7-11 when you do not have anim_meshes):
+#  10b. preprocess_image_only : DINOv2 encode straight from image/ -> npz_train_image_only (GPU)
+#
 # Usage:
 #   bash preprocess/run_pipeline.sh                              # run everything
 #   STAGES="rotate_meshes,normalize,preprocess_data" bash preprocess/run_pipeline.sh
 #   DATA_ROOT=Truebone_Z-OO ZOO_ROOT=zoo BLENDER=/path/to/blender bash preprocess/run_pipeline.sh
+#
+#   # Mesh-free path (no anim_meshes available):
+#   STAGES="move_fbx,extract_char,rotate_bvh,extract_pose,render_videos,extract_frames,preprocess_image_only" \
+#       bash preprocess/run_pipeline.sh
 
 set -euo pipefail
 
@@ -115,6 +122,11 @@ if should_run image_only; then
     "$PYTHON" preprocess/extract_image_only.py \
         --input_root "$ZOO_ROOT/npz_train" \
         --output_root "$ZOO_ROOT/npz_train_image_only"
+fi
+
+if should_run preprocess_image_only; then
+    header "10b" "preprocess_image_only (DINOv2 only, GPU)"
+    "$PYTHON" preprocess/preprocess_image_only.py --dataset_root "$ZOO_ROOT"
 fi
 
 echo

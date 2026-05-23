@@ -46,6 +46,19 @@ DATA_ROOT=Truebone_Z-OO ZOO_ROOT=zoo BLENDER=/opt/blender/blender PYTHON=python3
 | 10 | `preprocess_data` | `preprocess_data.py` | python + GPU | `zoo/npz_mesh_normed/` + `zoo/image/` | `zoo/npz_train/{motion}/y{deg}.npz` (`latent`, `image_embed`) |
 | 11 | `image_only` | `extract_image_only.py` | python | `zoo/npz_train/` | `zoo/npz_train_image_only/{motion}/y{deg}.npz` (`image_embed` only) |
 
+### Mesh-free alternative
+
+If you do not have `zoo/anim_meshes/` (stage 7 input), skip stages 7-11 and run this stage instead. It produces the same `npz_train_image_only/` artifact directly from `zoo/image/`, which is enough for the `video2pose` / `pose2rot` / `video2pose2rot` training pipelines (only `video2mesh` and `mesh2pose` truly require the mesh latent).
+
+| # | Stage | Script | Tool | Input | Output |
+|---|---|---|---|---|---|
+| 10b | `preprocess_image_only` | `preprocess_image_only.py` | python + GPU | `zoo/image/` | `zoo/npz_train_image_only/{motion}/y{deg}.npz` (`image_embed` only) |
+
+```bash
+STAGES="move_fbx,extract_char,rotate_bvh,extract_pose,render_videos,extract_frames,preprocess_image_only" \
+    bash preprocess/run_pipeline.sh
+```
+
 ## Output tree
 
 ```
