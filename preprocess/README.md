@@ -59,6 +59,42 @@ STAGES="move_fbx,extract_char,rotate_bvh,extract_pose,render_videos,extract_fram
     bash preprocess/run_pipeline.sh
 ```
 
+### Fast BVH video renderer
+
+`render_bvh_videos_fast.py` is a drop-in faster renderer for stage 5. It keeps the same dataset layout as the original renderer:
+
+```text
+zoo/video/{motion}/y{deg}.mp4
+```
+
+Example:
+
+```bash
+BLENDER=/opt/blender/blender python preprocess/render_bvh_videos_fast.py \
+    --zoo-root zoo \
+    --workers 4 \
+    --views y0,y30,y60,y90,y120,y150,y180,y210,y240,y270,y300,y330
+```
+
+The speedup comes from four changes:
+
+- EEVEE is used by default instead of the original Cycles render settings.
+- Multiple BVH views are rendered in batches inside long-lived Blender processes.
+- The character mesh and materials are imported once per Blender worker, then only vertex positions are updated per frame.
+- Frames are rendered directly as the requested image format before ffmpeg encodes the final mp4.
+
+To compare against the original renderer on a small Truebones subset:
+
+```bash
+BLENDER=/opt/blender/blender python preprocess/benchmark_render_bvh_videos.py \
+    --zoo-root zoo \
+    --benchmark-root compare_runs/render_benchmark_10 \
+    --motions 10 \
+    --view y0 \
+    --max-frames 100 \
+    --fast-workers 4
+```
+
 ## Output tree
 
 ```
