@@ -57,13 +57,13 @@ If you use this code, please consider cite:
 If you build on the V1 baselines, please also cite the underlying papers — `mesh2pose` is from **MoCapAnything (V1)**, and `video2mesh` is from **SWiT-4D**:
 
 ```bibtex
-@article{gong2025mocapanything,
-  title   = {MoCapAnything: Unified 3D Motion Capture for Arbitrary Skeletons from Monocular Videos},
-  author  = {Gong, Kehong and Wen, Zhengyu and He, Weixia and Xu, Mingxi and
-             Wang, Qi and Zhang, Ning and Li, Zhengyu and
-             Lian, Dongze and Zhao, Wei and He, Xiaoyu and Zhang, Mingyuan},
-  journal = {arXiv preprint arXiv:2512.10881},
-  year    = {2025}
+@InProceedings{Gong_2026_CVPR,
+  author    = {Gong, Kehong and Wen, Zhengyu and He, Weixia and Xu, Mingxi and Wang, Qi and Zhang, Ning and Li, Zhengyu and Lian, Dongze and Zhao, Wei and He, Xiaoyu and Zhang, Mingyuan},
+  title     = {MoCapAnything: Unified 3D Motion Capture for Arbitrary Skeletons from Monocular Videos},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  month     = {June},
+  year      = {2026},
+  pages     = {7089-7099}
 }
 
 @article{gong2025swit4d,
