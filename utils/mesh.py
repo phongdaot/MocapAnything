@@ -521,6 +521,10 @@ def blender_visualize_single_mesh_sequence(
     current_dir = os.path.dirname(__file__)
     blender_py_path = os.path.join(current_dir, "blender_mesh_utils.py")
     scene_blend_path = os.path.join(current_dir, scene + ".blend")
+    if not os.path.exists(scene_blend_path):
+        scene_blend_path = os.path.join(
+            os.path.dirname(current_dir), "preprocess", scene + ".blend"
+        )
 
     blender_cmd = [
         blender_path,
