@@ -3,6 +3,7 @@ import torch
 from .attention_blocks import *
 from torch.utils.checkpoint import checkpoint
 from typing import Optional
+from utils.rotation import add_rot6d_noise, add_pos_noise
 
 # =========================================================
 # Rest Encoder
@@ -540,7 +541,14 @@ class Pose2RotMemoryRestModel(nn.Module):
             use_cross_layers=decoder_use_cross_layers,
         )
 
-    def forward(self, batch, pose_override: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        batch,
+        pose_override: Optional[torch.Tensor] = None,
+        ref_noise_std: float = 0.0,
+        ref_pos_noise_std: float = 0.0,
+        ref_noise_target: str = "mem_rot",
+    ):
         joint_mask = batch["joint_mask"].bool()
         ancestor_mask = batch["ancestor_mask"].bool()
         graph_hop = batch["graph_hop"]
@@ -550,6 +558,7 @@ class Pose2RotMemoryRestModel(nn.Module):
         pose = pose_override if pose_override is not None else batch["position"]                        # [B,T,J,3]
         memory_pose = batch["memory_pose"]              # [B,N,J,3]
         memory_rot6d = batch["memory_rot6d"]            # [B,N,J,6]
+        ref_pose = batch["ref_position"]                # [B,J,3]
         ref_rot6d = batch["ref_rot6d_a"]                # [B,J,6]
         offset = batch["offset_a"]                      # [B,J,3]
         joint_t5embed = batch["joint_t5embed"]          # [B,J,768]
@@ -572,6 +581,23 @@ class Pose2RotMemoryRestModel(nn.Module):
                     idx = torch.arange(n_use, device=memory_pose.device)
                 memory_pose = memory_pose.index_select(1, idx)
                 memory_rot6d = memory_rot6d.index_select(1, idx)
+
+        # -------------------------------------------------------
+        # reference noise (robustness ablation): perturb the reference
+        # pose/rotation that anchors the rotation coordinate system.
+        #   ref_noise_target in {"mem_rot","mem_pose","static","all"}
+        #   ref_noise_std     : rotation noise magnitude in degrees
+        #   ref_pos_noise_std : position noise std (normalized units)
+        # No-op when both stds are 0, so default behaviour is unchanged.
+        # -------------------------------------------------------
+        if ref_noise_std and ref_noise_std > 0:
+            if ref_noise_target in ("mem_rot", "all"):
+                memory_rot6d = add_rot6d_noise(memory_rot6d, ref_noise_std)
+            if ref_noise_target in ("static", "all"):
+                ref_rot6d = add_rot6d_noise(ref_rot6d, ref_noise_std)
+        if ref_pos_noise_std and ref_pos_noise_std > 0:
+            if ref_noise_target in ("mem_pose", "all"):
+                memory_pose = add_pos_noise(memory_pose, ref_pos_noise_std)
 
         rest_embed = self.rest_encoder(
             offset=offset,

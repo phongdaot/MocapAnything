@@ -209,6 +209,9 @@ def run_evaluation(
     writer=None,
     epoch=None,
     tag_prefix="test",
+    ref_noise_std=0.0,
+    ref_pos_noise_std=0.0,
+    ref_noise_target="mem_rot",
 ):
     model.eval()
     metric_sums = {
@@ -258,6 +261,9 @@ def run_evaluation(
                 pose_source_mode="pred",
                 pose_mix_prob=pose_pred_prob,
                 detach_pred_pose_for_rot=cfg["train"]["pose_input"]["detach_pred_pose_for_rot"],
+                ref_noise_std=ref_noise_std,
+                ref_pos_noise_std=ref_pos_noise_std,
+                ref_noise_target=ref_noise_target,
             )
 
             metrics = evaluate_joint_metrics(model_out, batch)
@@ -468,7 +474,24 @@ def train_video2pose2rot(cfg):
     grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
     
     split_groups = eval_cfg.get("split_groups", ["seen", "rare", "unseen"])
-    
+
+    # ---- reference-noise training config (robustness ablation) ----
+    #   train.ref_noise:
+    #     enabled: bool          # default False -> unchanged behaviour
+    #     std_max: float         # rotation noise upper bound in degrees
+    #     pos_std_max: float     # position noise upper bound (normalized units)
+    #     target: str            # mem_rot | mem_pose | static | all
+    #     sample: str            # "uniform" (per-step U[0,std_max]) or "fixed"
+    ref_noise_cfg = train_cfg.get("ref_noise", {})
+    ref_noise_enabled = ref_noise_cfg.get("enabled", False)
+    ref_noise_std_max = float(ref_noise_cfg.get("std_max", 0.0))
+    ref_noise_pos_std_max = float(ref_noise_cfg.get("pos_std_max", 0.0))
+    ref_noise_target = ref_noise_cfg.get("target", "mem_rot")
+    ref_noise_sample = ref_noise_cfg.get("sample", "uniform")
+    if is_main_process() and ref_noise_enabled:
+        print(f"[ref_noise] train with noise: std_max={ref_noise_std_max}deg "
+              f"pos_std_max={ref_noise_pos_std_max} target={ref_noise_target} sample={ref_noise_sample}")
+
     for epoch in range(start_epoch, epochs):
         if distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -510,6 +533,19 @@ def train_video2pose2rot(cfg):
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
 
+            # per-step reference noise (fresh noise each step; magnitude fixed
+            # or sampled from U[0, std_max] for robustness across the test sweep)
+            if ref_noise_enabled:
+                if ref_noise_sample == "uniform":
+                    step_ref_noise_std = float(np.random.uniform(0.0, ref_noise_std_max))
+                    step_ref_pos_noise_std = float(np.random.uniform(0.0, ref_noise_pos_std_max))
+                else:
+                    step_ref_noise_std = ref_noise_std_max
+                    step_ref_pos_noise_std = ref_noise_pos_std_max
+            else:
+                step_ref_noise_std = 0.0
+                step_ref_pos_noise_std = 0.0
+
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 model_out = model(
                     batch=batch,
@@ -518,6 +554,9 @@ def train_video2pose2rot(cfg):
                     pose_source_mode="pred", # pred
                     pose_mix_prob=pose_pred_prob,
                     detach_pred_pose_for_rot=train_cfg["pose_input"]["detach_pred_pose_for_rot"],
+                    ref_noise_std=step_ref_noise_std,
+                    ref_pos_noise_std=step_ref_pos_noise_std,
+                    ref_noise_target=ref_noise_target,
                 )
 
                 total_loss, loss_dict = compute_joint_total_loss(

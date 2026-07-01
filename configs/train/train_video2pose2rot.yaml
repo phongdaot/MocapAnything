@@ -97,6 +97,17 @@ train:
   vis_every: 5
   weight_decay: 0.0
 
+  # reference-noise robustness ablation (train with noise on the rotation anchor).
+  # enabled: false -> default behaviour (no noise). Fresh noise is drawn each step;
+  # with sample=uniform the magnitude is drawn from U[0, std_max] so one model is
+  # robust across the whole test sweep. Evaluate with train/eval_noise_sweep.py.
+  ref_noise:
+    enabled: false
+    std_max: 30.0        # rotation noise upper bound, degrees
+    pos_std_max: 0.0     # position noise upper bound (normalized units)
+    target: mem_rot      # mem_rot | mem_pose | static | all
+    sample: uniform      # uniform (U[0,std_max] per step) | fixed
+
 eval:
   batch_size: 1
   num_workers: 2

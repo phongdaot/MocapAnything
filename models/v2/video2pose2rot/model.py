@@ -65,6 +65,9 @@ class Video2Pose2RotModel(nn.Module):
 
         # stage2: pose -> rot
         self.pos2rot = instantiate_from_config(p2r_cfg)
+        self.pos2rot_accepts_ref_noise = (
+            "ref_noise_std" in inspect.signature(self.pos2rot.forward).parameters
+        )
 
     def forward(
         self,
@@ -73,6 +76,9 @@ class Video2Pose2RotModel(nn.Module):
         pose_source_mode: str = "pred",
         pose_mix_prob: float = 1.0,
         detach_pred_pose_for_rot: bool = False,
+        ref_noise_std: float = 0.0,
+        ref_pos_noise_std: float = 0.0,
+        ref_noise_target: str = "mem_rot",
     ):
         gt_position = batch["position"]   # [B,T,J,3]
 
@@ -101,10 +107,14 @@ class Video2Pose2RotModel(nn.Module):
         # -------------------------
         # stage2: pos2rot
         # -------------------------
-        pos2rot_out = self.pos2rot(
-            batch=batch,
-            pose_override=pose_for_rot,
-        )
+        p2r_kwargs = dict(batch=batch, pose_override=pose_for_rot)
+        if self.pos2rot_accepts_ref_noise:
+            p2r_kwargs.update(
+                ref_noise_std=ref_noise_std,
+                ref_pos_noise_std=ref_pos_noise_std,
+                ref_noise_target=ref_noise_target,
+            )
+        pos2rot_out = self.pos2rot(**p2r_kwargs)
 
         return {
             "pred_position": pred_position,

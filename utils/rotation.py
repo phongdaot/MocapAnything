@@ -1,5 +1,6 @@
 ### rotation.py ###
-from .transforms3d import rotation_6d_to_matrix, matrix_to_euler_angles
+import math
+from .transforms3d import rotation_6d_to_matrix, matrix_to_euler_angles, axis_angle_to_matrix
 from .mesh import extract_mesh_from_bvh
 from . import bvh as BVH
 from . import animation as animation
@@ -86,6 +87,50 @@ def rot6d_to_rotmat_batch(rot_6d):
         rotmat = np.stack([b1, b2, b3], axis=-1)
         rotmat = rotmat.reshape(*rot_6d.shape[:-1], 3, 3)
         return rotmat
+
+# =========================================================
+# Reference-noise helpers (for the ref-noise robustness ablation)
+# =========================================================
+def add_rot6d_noise(rot6d, std_deg):
+    """
+    Perturb each joint's 6D rotation by a random rotation of magnitude ~std_deg.
+
+    A random axis (uniform on the sphere) and a Gaussian angle with std=std_deg
+    (in degrees) form a delta rotation dR; the reference rotation R is replaced by
+    dR @ R. Uses the SAME 6D convention as ``rot6d_to_rotmat_tensor`` (first two
+    COLUMNS of the rotation matrix) so it is consistent with the model / FK, not the
+    row-major convention in transforms3d.
+
+    Args:
+        rot6d:   Tensor [..., 6]
+        std_deg: float, noise magnitude in degrees (<=0 -> no-op passthrough)
+    Returns:
+        Tensor [..., 6] with the same dtype/shape as ``rot6d``.
+    """
+    if not std_deg or std_deg <= 0:
+        return rot6d
+
+    dtype = rot6d.dtype
+    R = rot6d_to_rotmat_tensor(rot6d.float())               # [...,3,3], columns = b1,b2,b3
+    lead = rot6d.shape[:-1]
+
+    axis = torch.randn(*lead, 3, device=rot6d.device, dtype=torch.float32)
+    axis = axis / (axis.norm(dim=-1, keepdim=True) + 1e-8)
+    angle = torch.randn(*lead, 1, device=rot6d.device, dtype=torch.float32) * (std_deg * math.pi / 180.0)
+    dR = axis_angle_to_matrix(axis * angle)                 # [...,3,3]
+
+    R_noisy = dR @ R
+    # back to 6D in the column convention: first two columns flattened
+    out = torch.cat([R_noisy[..., :, 0], R_noisy[..., :, 1]], dim=-1)
+    return out.to(dtype)
+
+
+def add_pos_noise(pos, std):
+    """Add isotropic Gaussian noise (std, in normalized position units) to positions."""
+    if not std or std <= 0:
+        return pos
+    return pos + std * torch.randn_like(pos)
+
 
 def rotmat_to_euler_deg(rotmat, order='zyx'):
     shape = rotmat.shape[:-2]
