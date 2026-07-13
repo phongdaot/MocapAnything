@@ -112,6 +112,7 @@ pycparser==2.22
 pycryptodome==3.23.0
 pydantic==2.12.5
 pydantic_core==2.41.5
+pygltflib==1.16.5
 pyemd==1.1.0
 Pygments==2.19.1
 pymeshlab==2025.7

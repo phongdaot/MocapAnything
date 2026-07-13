@@ -620,8 +620,9 @@ def inference(cfg, device, attention_design, model, pipe, rmbg_net, seq_name, im
     if cfg["output"].get("blender_path", None) is not None and os.path.exists(cfg["output"]["blender_path"]):
         if stage_cb is not None:
             stage_cb("render")
-        
-        for azim in [(0, "camera"), (-60, "side")]:  # 只渲 camera+side(省 33% 渲染)
+
+        try:
+          for azim in [(0, "camera"), (-60, "side")]:  # 只渲 camera+side(省 33% 渲染)
 
             output_dir = os.path.join(save_dir, azim[1])
             video_exists = any(
@@ -667,6 +668,9 @@ def inference(cfg, device, attention_design, model, pipe, rmbg_net, seq_name, im
             #         bg_color=(255, 255, 255),
             #         azim=zim,
             #     )
+        except Exception as _re:
+            logger.warning(f"[render skip] {species_name}: Blender render failed ({_re}); "
+                           f"pose/BVH outputs are already saved — check BLENDER_BIN if you want the mesh render.")
 
         # 沙盒:mesh 渲完 → 一步到位拼最终布局(web demo):
         #   输入 | 骨架cam | mesh_cam | 骨架side | mesh_side(统一高 400 横拼)
