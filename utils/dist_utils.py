@@ -3,6 +3,7 @@ import torch.distributed as dist
 import torch
 import numpy as np
 import os
+from datetime import timedelta
 
 def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
@@ -22,7 +23,8 @@ def setup_distributed():
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # 发布配方:默认 10min timeout 在长 eval / 慢 rank(epoch 边界)会 NCCL timeout 崩,拉到 60min
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(minutes=60))
         dist.barrier()
         if is_main_process():
             print(f"[INFO] 初始化分布式训练: rank {rank}/{world_size} (GPU {local_rank})")

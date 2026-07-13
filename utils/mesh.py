@@ -303,9 +303,12 @@ def extract_mesh_from_bvh(
     scale: float = 1.0,
     mesh_scale: float = 1.0,
     azim: float = 0.0,
+    return_arrays: bool = False,
 ):
     """
     Extract mesh animation from a BVH file and save as mesh sequence.
+    return_arrays=True: 只返回 (verts[F,V,3], faces[T,3], joints[F,J,3], parents[J]),
+                        跳过逐帧写盘(供 Web 端导出交互式 3D glb)。
     """
     skin_weights = torch.from_numpy(np.load(lbs_weights_pth))
     temp_vertices, temp_faces, temp_uvs, temp_face_uvs = read_obj_mesh(template_pth)
@@ -352,6 +355,13 @@ def extract_mesh_from_bvh(
 
         verts = torch.matmul(verts, R_torch.T)
         pelvis_pos_scaled = pelvis_pos_scaled @ R.T
+        J_transformed = torch.matmul(J_transformed, R_torch.T)
+
+    if return_arrays:
+        return (verts.detach().cpu().numpy(),
+                np.asarray(temp_faces),
+                J_transformed.detach().cpu().numpy(),
+                np.asarray(anim.parents))
 
     os.makedirs(save_root, exist_ok=True)
     has_uv = temp_uvs is not None and temp_face_uvs is not None
@@ -418,6 +428,9 @@ def blender_visualize_character_motion(
     auto_scale: Literal[None, "bvh", "base_mesh"] = None,
     mesh_scale: float = 1.0,
     azim: float = 0.0,
+    render_samples: int = 128,
+    fast_render: bool = False,
+    render_resolution: int = 0,
 ) -> None:
     """
     Visualize character motion by converting BVH animation to a mesh sequence,
@@ -494,6 +507,9 @@ def blender_visualize_character_motion(
         camera_traj=camera_traj_pth,
         bg_color=bg_color,
         video_name=motion_name,
+        render_samples=render_samples,
+        fast_render=fast_render,
+        render_resolution=render_resolution,
     )
 
 
@@ -510,6 +526,9 @@ def blender_visualize_single_mesh_sequence(
     bg_color=(255, 255, 255),
     video_name: str = "video",
     log_file: str = None,
+    render_samples: int = 128,
+    fast_render: bool = False,
+    render_resolution: int = 0,
 ) -> None:
     """
     Render a sequence of mesh frames using Blender and generate a video.
@@ -542,6 +561,11 @@ def blender_visualize_single_mesh_sequence(
         blender_cmd += ["--hdri", hdri_path]
     if camera_traj:
         blender_cmd += ["--camera-traj", camera_traj]
+    blender_cmd += ["--samples", str(render_samples)]
+    if fast_render:
+        blender_cmd += ["--fast"]
+    if render_resolution and render_resolution > 0:
+        blender_cmd += ["--resolution", str(render_resolution)]
 
     if log_file is None:
         log_file = os.path.join(output_dir, "blender.log")

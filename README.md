@@ -14,11 +14,21 @@
 
 <p align="center"><sub>▶ Click the image to watch the 90-second teaser on the project page.</sub></p>
 
+## Updates
+
+- **[2026-05-01]** — 🎉 Code released: end-to-end `video2pose2rot` inference + the release training pipeline.
+- **[2026-07-13]** — 🏋️ Pretrained weights on HuggingFace (`kehong/MoCapAnythingV2-weights`).
+- **[2026-07-13]** — 🎮 Local interactive demo (`demo/app.py`) + demo data on HuggingFace.
+- **[2026-07-13]** — 💃 Dance Anything tab: dance video (with music) → SAM2 picks the dancer → animal performs the dance with the original audio.
+- **[TODO]** — 🌐 Hosted online demo (HuggingFace Space) — try it in the browser, no setup.
+- **[TODO]** — 📦 Full training datasets released on HuggingFace.
+
 ## Highlights
 
 - 🔗 **Fully end-to-end.** Video → Pose → Rotation jointly optimized — no analytical IK in the loop.
 - ⚓ **Reference-anchored rotation.** A single reference pose–rotation pair from the target asset defines the rotation coordinate system, turning pose-to-rotation into a well-constrained problem.
 - ⚡ **Mesh-free and fast.** Joints predicted directly from video, ~20× faster than mesh-based pipelines.
+- 🎮 **Interactive web demo.** A Gradio app (`demo/app.py`) with two tabs: **Mocap · Retarget** (video → pose skeleton + Blender mesh render, `.npy` downloadable) and **💃 Dance Anything** (drop a dance video with music → SAM2 picks the dancer → a target animal performs the dance, re-muxed with the original audio).
 
 ## Pipeline
 
@@ -33,6 +43,26 @@ The V2 main model is **`video2pose2rot`** — a single end-to-end network that m
 | `mesh2pose` | V1 baseline — joints from per-frame meshes | Mesh sequence + reference pose | Joint positions |
 
 A reference frame from a matching species guides the per-species skeleton and scale, enabling generalization to unseen animals.
+
+## Quick Start
+
+Clone the repo, grab the weights + demo data from HuggingFace, and run the bundled examples (or your own videos) end-to-end — no dataset preprocessing required.
+
+```bash
+pip install torch torchvision numpy trimesh pyyaml tqdm huggingface_hub pillow imageio imageio-ffmpeg transformers gradio
+
+# Weights → ./checkpoints/   ·   Demo data (~160 MB, 1-frame references) → ./demo/data/
+hf download kehong/MoCapAnythingV2-weights --local-dir ./checkpoints
+hf download kehong/MoCapAnythingV2-data-sample --repo-type dataset --local-dir ./demo/data
+
+# Command-line inference (zoo / obj / in-the-wild)
+python inference/video2pose2rot.py --config demo/configs/demo_zoo.yaml
+
+# …or the interactive web demo
+python demo/app.py            # http://localhost:7860
+```
+
+> Rendering requires a Blender binary (4.x/5.x) on `PATH` — see [RUN.md](RUN.md) for the `blender_mocapanything.sh` wrapper and env vars. Checkpoints and datasets live on HuggingFace; only code ships in this repo. The background remover (`briaai/RMBG-1.4`) and DINOv2 auto-download on first run.
 
 ## Install & Run
 

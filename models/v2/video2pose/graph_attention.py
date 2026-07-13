@@ -5,7 +5,8 @@ import torch
 # ====================================================================
 # ==================== 模型定义 =======================================
 class GraphMultiHeadAttention(nn.Module):
-    def __init__(self, d_model, nheads=4, dropout=0.1, max_path_len=5, value_emb=False):
+    def __init__(self, d_model, nheads=4, dropout=0.1, max_path_len=5, value_emb=False,
+                 use_tree_mask=False):
         super().__init__()
         self.nheads = nheads
         self.att_size = d_model // nheads
@@ -19,6 +20,7 @@ class GraphMultiHeadAttention(nn.Module):
 
         self.max_path_len = max_path_len
         self.value_emb_flag = value_emb
+        self.use_tree_mask = use_tree_mask
 
         self.topology_key_emb = nn.Embedding(max_path_len + 1, d_model)
         self.edge_key_emb = nn.Embedding(6, d_model)
@@ -36,6 +38,7 @@ class GraphMultiHeadAttention(nn.Module):
             distance,  # BJJ
             edge_attr,  # BJJ
             mask=None,  # BJ
+            tree_mask=None,  # [B,J,J] or [B,F,J,J] 树状(祖先)注意力 mask
     ):
         # 有时候是时序的输入:  BFJJ -> BF,J,J
         if distance.dim() == 4:
@@ -43,6 +46,8 @@ class GraphMultiHeadAttention(nn.Module):
             distance = distance.reshape(B * F, J, J)
             edge_attr = edge_attr.reshape(B * F, J, J)
             mask = mask.reshape(B * F, J)
+            if tree_mask is not None:
+                tree_mask = tree_mask.reshape(B * F, J, J)
 
         orig_q_size = q.size()
         d_k = self.att_size
@@ -80,23 +85,30 @@ class GraphMultiHeadAttention(nn.Module):
         attn_score = torch.matmul(q, k.transpose(2, 3)) + spatial_bias + edge_bias
         attn_score = attn_score * self.scale
 
-        # if mask is not None:
-        #     attn_score = attn_score + mask
+        # tree mask（树状/祖先 attention:非祖先边置 -inf,与 lab 对齐）
+        if tree_mask is not None and self.use_tree_mask:
+            attn_score = attn_score.masked_fill(~tree_mask[:, None, :, :], float('-inf'))
+
+        # key mask（无效 key 列）
         if mask is not None:  # mask  B, J
-            # mask_k = mask[:, None, None, :]
-            # mask_q = mask[:, None, :, None]
-            # attn_score = attn_score.masked_fill(~(mask_k & mask_q), float('-inf'))
-            # 1. mask掉无效key（列）
             mask_k = mask[:, None, None, :]  # [B,1,1,J]
             attn_score = attn_score.masked_fill(~mask_k, float('-inf'))
-            # 2. softmax
-            attn = torch.softmax(attn_score, dim=3)
-            # 3. mask掉无效query（行）——无效query对应的全行都置0
+
+        # 避免整行都是 -inf 导致 NaN(tree_mask 可能让某行全 -inf)
+        invalid_rows = torch.isinf(attn_score).all(dim=-1, keepdim=True)
+        attn_score = torch.where(invalid_rows, torch.zeros_like(attn_score), attn_score)
+
+        attn = torch.softmax(attn_score.float(), dim=-1).to(attn_score.dtype)
+
+        # query mask（无效 query 行归零）
+        if mask is not None:
             mask_q = mask[:, None, :, None].float()  # [B,1,Q,1]
-            attn = attn * mask_q  # 这里直接把无效query全行归零
-        else:
-            assert 'False'
-            attn = torch.softmax(attn_score, dim=3)
+            attn = attn * mask_q
+
+        # 再乘一次 tree mask，确保非法边为 0
+        if tree_mask is not None and self.use_tree_mask:
+            attn = attn * tree_mask[:, None, :, :].float()
+
         attn = self.dropout(attn)
 
         if self.value_emb_flag:

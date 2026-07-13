@@ -550,6 +550,7 @@ class Pose2RotMemoryRestModel(nn.Module):
         pose = pose_override if pose_override is not None else batch["position"]                        # [B,T,J,3]
         memory_pose = batch["memory_pose"]              # [B,N,J,3]
         memory_rot6d = batch["memory_rot6d"]            # [B,N,J,6]
+        ref_pose = batch["ref_position"]                # [B,J,3]  (num_memory==-1 分支需要;此前漏读导致 NameError)
         ref_rot6d = batch["ref_rot6d_a"]                # [B,J,6]
         offset = batch["offset_a"]                      # [B,J,3]
         joint_t5embed = batch["joint_t5embed"]          # [B,J,768]

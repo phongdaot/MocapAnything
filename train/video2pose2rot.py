@@ -106,6 +106,14 @@ def evaluate_rot_metrics(model_out: Dict[str, Any], batch: Dict[str, Any]):
     rot_joint_mask = joint_mask & (~static_rot_mask)
     pos_joint_mask = joint_mask & (~static_pos_mask)
 
+    # 退化物种(刚体:所有关节 static-rot)会让 rot_joint_mask 整行为空,
+    # 角度/角速度指标会在空数组上计算(np.mean([])->nan / scipy R.from_matrix 崩)。
+    # 此时回退到用该样本的全部有效关节(joint_mask)评分,保证非空、有限、不崩。
+    _empty_rot_rows = ~rot_joint_mask.any(dim=1)
+    if _empty_rot_rows.any():
+        rot_joint_mask = rot_joint_mask.clone()
+        rot_joint_mask[_empty_rot_rows] = joint_mask[_empty_rot_rows]
+
     target_pose = batch["position"]
     parents = batch["parent_a"]
     offsets = batch["offset_a"]
@@ -252,6 +260,10 @@ def run_evaluation(
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
 
+            # no-joint-embed:评测同训练,置零 joint_t5embed(与 lab --ablate_no_t5 一致)
+            if cfg.get("train", {}).get("no_joint_embed", False):
+                batch["joint_t5embed"] = torch.zeros_like(batch["joint_t5embed"])
+
             model_out = model(
                 batch=batch,
                 attention_kwargs=attention_design,
@@ -300,17 +312,22 @@ def run_evaluation(
 
     sample_count = reduce_sum_scalar(sample_count, device)
     
-    for k in metric_sums:
+    for k in list(metric_sums.keys()):
         metric_sums[k] = reduce_sum_scalar(metric_sums[k], device) / max(sample_count, 1)
-            
-    
+
+    # pose 归一化到 [-1,1] 单位立方(约定 = 1 米立方,边长 2 单位)→ 1 单位 = 50cm。
+    # mpjpe/mpjve 是归一化空间的关节距离,×50 得到 cm,便于与论文对齐。
+    MPJPE_CM_SCALE = 50.0
+    metric_sums["pose_mpjpe_cm"] = metric_sums["pose_mpjpe"] * MPJPE_CM_SCALE
+    metric_sums["pose_mpjve_cm"] = metric_sums["pose_mpjve"] * MPJPE_CM_SCALE
+
     if is_main_process():
         print(
-            f"[Eval] "
+            f"[Eval {tag_prefix}] "
             f"pose_l1={metric_sums['pose_l1']:.6f}, "
             f"pose_l2={metric_sums['pose_l2']:.6f}, "
-            f"pose_mpjpe={metric_sums['pose_mpjpe']:.6f}, "
-            f"pose_mpjve={metric_sums['pose_mpjve']:.6f}, "
+            f"pose_mpjpe={metric_sums['pose_mpjpe']:.6f} ({metric_sums['pose_mpjpe_cm']:.2f}cm), "
+            f"pose_mpjve={metric_sums['pose_mpjve']:.6f} ({metric_sums['pose_mpjve_cm']:.2f}cm), "
             f"pose_speed_l1={metric_sums['pose_speed_l1']:.6f}, "
             f"pose_speed_l2={metric_sums['pose_speed_l2']:.6f}, "
             f"rot_l1={metric_sums['rot_l1']:.6f}, "

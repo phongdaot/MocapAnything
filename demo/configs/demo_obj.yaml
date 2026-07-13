@@ -1,0 +1,76 @@
+runtime:
+  device: cuda
+  seed: 42
+weights:
+  video2pose_ckpt_root: ./checkpoints
+  rmbg_weights_dir: briaai/RMBG-1.4
+  ckpt_name: video2pos2rot_epoch60.pt
+experiment:
+  exp: ""
+ablate_no_t5: false
+model:
+  target: models.v2.video2pose2rot.model.Video2Pose2RotModel
+  params:
+    v2p_cfg:
+      target: models.v2.video2pose.model.RefGuidedVideo2PoseModel
+      params:
+        q_dim: 256
+        num_layers: 8
+        num_heads: 8
+        ref_layers: 4
+        img_dim: 1024
+        num_joints: 150
+        use_graph_ref_outer: false
+        use_graph_ref_inner: true
+        use_graph_temporal_outer: false
+        use_graph_temporal_inner: true
+        use_joint_embed: true
+    p2r_cfg:
+      target: models.v2.pose2rot.model.Pose2RotMemoryRestModel
+      params:
+        q_dim: 256
+        rest_layers: 4
+        pose_layers: 4
+        memory_layers: 4
+        decoder_layers: 8
+        num_heads: 8
+        joint_embed_dim: 768
+        temporal_window: 2
+        temporal_dropout: 0.1
+        decoder_cond_mode: add
+        pose_rest_film: true
+        memory_rest_film: true
+        decoder_rest_film: true
+        pose_use_graph: true
+        use_grad_checkpoint: false
+        decoder_use_cross_layers: 6
+  attention_kwargs:
+    seq_len: 32
+    selfatt_temporal_layer_flag: []
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 5
+    crossatt2_slidwindow: 5
+data:
+  base_dir: ./demo/data/obj1k
+  memory_pkl_path: null
+  scale_dict_path: ./demo/data/obj1k/cache/__mesh2pose1002_species_scale_cache.pkl
+  character_dir: ./demo/data/obj1k/characters
+  bvh_roots:
+  - ./demo/data/obj1k/bvh
+  video_roots:
+  - ./demo/data/inputs/nbg_obj
+  frames_tmp_root: ./demo_outputs/_frames_obj
+  retarget:
+    toggle: false
+    ref_seq: ''
+    ref_idx: 0
+  wild_flag: false
+output:
+  blender_path: ./blender_mocapanything.sh
+  output_tag: demo_obj
+  save_dir: ./demo_outputs/obj
+  fps: 15
+  export_gt_mesh: false
+  export_gt_video: false
+use_lab_model: false

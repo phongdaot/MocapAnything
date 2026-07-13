@@ -14,9 +14,9 @@ class Video2PoseModelSliding(nn.Module):
         self.img_proj = nn.Linear(img_dim, q_dim)
         if self.use_graph_temporal_outer:
             # === 新增 graph attention 层 ===
-            self.graph_attn = GraphMultiHeadAttention(q_dim, num_heads)
+            self.graph_attn = GraphMultiHeadAttention(q_dim, num_heads, use_tree_mask=True)
         if self.use_graph_temporal_inner:
-            self.blocks_graph = nn.ModuleList([GraphMultiHeadAttention(q_dim, num_heads) for i in range(num_layers)])
+            self.blocks_graph = nn.ModuleList([GraphMultiHeadAttention(q_dim, num_heads, use_tree_mask=(i % 2 == 0)) for i in range(num_layers)])
         self.blocks_img = nn.ModuleList([
             SlidingWindowDiTBlock(
                 q_dim, num_heads,
@@ -36,7 +36,7 @@ class Video2PoseModelSliding(nn.Module):
         )
 
     def forward(self, ref_query, cond_img, joint_mask=None, attention_kwargs=None,
-                graph_hop=None, graph_edge=None):
+                graph_hop=None, graph_edge=None, tree_mask=None):
 
         B, T, _, _ = cond_img.shape
         _, J, D = ref_query.shape
@@ -46,7 +46,7 @@ class Video2PoseModelSliding(nn.Module):
 
         # ✅ (1) 可选在整个 temporal 前加入 Graph Attention
         if self.use_graph_temporal_outer and graph_hop is not None:
-            queries = queries + self.graph_attn(queries, queries, queries, graph_hop, graph_edge, joint_mask)
+            queries = queries + self.graph_attn(queries, queries, queries, graph_hop, graph_edge, joint_mask, tree_mask=tree_mask)
 
         # attention_kwargs 可直接外部传入，不要提前pop
         for i, block_img in enumerate(self.blocks_img):
@@ -58,7 +58,10 @@ class Video2PoseModelSliding(nn.Module):
             )
 
             if self.use_graph_temporal_inner and graph_hop is not None:
-                queries = queries + self.blocks_graph[i](queries, queries, queries, graph_hop, graph_edge, joint_mask)
+                queries = queries + self.blocks_graph[i](queries, queries, queries, graph_hop, graph_edge, joint_mask, tree_mask=tree_mask)
+
+                if joint_mask is not None:
+                    queries = queries * joint_mask.reshape(B * T, J).unsqueeze(-1).float()
 
         out = self.head(queries)
         out = out.reshape(B, T, out.size(1), out.size(2))
@@ -67,20 +70,20 @@ class Video2PoseModelSliding(nn.Module):
 
 # ---- 单层融合模块：self + cross1 + cross2 ----
 class RefFusionBlock(nn.Module):
-    def __init__(self, q_dim=256, num_heads=8, cross_dim=256):
+    def __init__(self, q_dim=256, num_heads=8, cross_dim=256, use_tree_mask=True):
         super().__init__()
         processor = SimpleAttnProcessor()
         # === 新增 graph attention 层 ===
-        self.graph_attn = GraphMultiHeadAttention(q_dim, num_heads)
+        self.graph_attn = GraphMultiHeadAttention(q_dim, num_heads, use_tree_mask=use_tree_mask)
         self.self_attn = SimpleAttention(q_dim, num_heads, processor=processor)
         self.cross_img = SimpleAttention(q_dim, num_heads, processor=processor)
         self.norm = nn.LayerNorm(q_dim)
         self.res_scale = nn.Parameter(torch.ones(1))  # 可学习残差比例
 
-    def forward(self, x, img_cond, joint_mask=None, attention_kwargs=None, graph_hop=None, graph_edge=None):
+    def forward(self, x, img_cond, joint_mask=None, attention_kwargs=None, graph_hop=None, graph_edge=None, tree_mask=None):
         # === 新增: Graph Attention ===
         if graph_hop is not None and graph_edge is not None:
-            x = x + self.graph_attn(x, x, x, graph_hop, graph_edge, joint_mask)  # debug进去看下, mask需要改一下-1e9
+            x = x + self.graph_attn(x, x, x, graph_hop, graph_edge, joint_mask, tree_mask=tree_mask)  # debug进去看下, mask需要改一下-1e9
 
         # --- self-attn ---  (有了graph attention之后还需要这个吗?)
         x = x + self.self_attn(x, joint_mask=joint_mask)
@@ -110,17 +113,17 @@ class RefQueryEncoder(nn.Module):
         if self.use_joint_embed:
             self.joint_t5proj = nn.Linear(joint_embed_dim, q_dim)
         if self.use_graph_ref_outer:
-            self.graph_attn = GraphMultiHeadAttention(q_dim, num_heads)
+            self.graph_attn = GraphMultiHeadAttention(q_dim, num_heads, use_tree_mask=True)
 
-        # === 叠加若干融合层 ===
+        # === 叠加若干融合层 ===  (偶数层用树状 mask,与 lab 对齐)
         self.fusion_blocks = nn.ModuleList([
-            RefFusionBlock(q_dim=q_dim, num_heads=num_heads, cross_dim=q_dim)
-            for _ in range(num_layers)
+            RefFusionBlock(q_dim=q_dim, num_heads=num_heads, cross_dim=q_dim, use_tree_mask=(i % 2 == 0))
+            for i in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(q_dim)
 
-    def forward(self, ref_position, ref_image_embed, 
-                joint_mask=None, attention_kwargs=None, graph_hop=None, graph_edge=None, joint_t5embed=None):
+    def forward(self, ref_position, ref_image_embed,
+                joint_mask=None, attention_kwargs=None, graph_hop=None, graph_edge=None, joint_t5embed=None, tree_mask=None):
         ref_position_enc = self.pos_embedder(ref_position)
         x = self.pose_proj(ref_position_enc)
         # === 融合 joint embedding ===
@@ -133,7 +136,7 @@ class RefQueryEncoder(nn.Module):
 
         # ✅ 2. 可选 graph attention 先于融合层
         if self.use_graph_ref_outer and graph_hop is not None:
-            x = x + self.graph_attn(x, x, x, graph_hop, graph_edge, joint_mask)
+            x = x + self.graph_attn(x, x, x, graph_hop, graph_edge, joint_mask, tree_mask=tree_mask)
 
         img_cond = self.img_proj(ref_image_embed)
 
@@ -141,7 +144,8 @@ class RefQueryEncoder(nn.Module):
             x = blk(x, img_cond, joint_mask=joint_mask,
                     attention_kwargs=attention_kwargs,
                     graph_hop=graph_hop if self.use_graph_ref_inner else None,
-                    graph_edge=graph_edge if self.use_graph_ref_inner else None)
+                    graph_edge=graph_edge if self.use_graph_ref_inner else None,
+                    tree_mask=tree_mask if self.use_graph_ref_inner else None)
 
         if joint_mask is not None:
             x = x * joint_mask.unsqueeze(-1).float()
@@ -192,6 +196,7 @@ class RefGuidedVideo2PoseModel(nn.Module):
         graph_hop = batch["graph_hop"]  # B J J
         graph_edge = batch["graph_edge"]  # B J J
         joint_t5embed = batch["joint_t5embed"]
+        ancestor_mask = batch["ancestor_mask"].bool()  # [B,J,J] 树状(祖先)注意力 mask
 
         # 1️⃣ 得到参考帧的融合query
         ref_query = self.ref_encoder(
@@ -202,6 +207,7 @@ class RefGuidedVideo2PoseModel(nn.Module):
             graph_hop=graph_hop,
             graph_edge=graph_edge,
             joint_t5embed=joint_t5embed,
+            tree_mask=ancestor_mask,
         )
 
         # 重新shape一下 joint_mask for temporal  [B*1,J]  -> [B, F,J]
@@ -209,6 +215,7 @@ class RefGuidedVideo2PoseModel(nn.Module):
         joint_mask = joint_mask.unsqueeze(1).expand(-1, F, -1)
         graph_hop = graph_hop.unsqueeze(1).expand(-1, F, -1, -1)
         graph_edge = graph_edge.unsqueeze(1).expand(-1, F, -1, -1)
+        ancestor_mask_t = ancestor_mask.unsqueeze(1).expand(-1, F, -1, -1)
 
         # 2️⃣ 时序模型
         pose_pred = self.temporal_model(
@@ -218,6 +225,7 @@ class RefGuidedVideo2PoseModel(nn.Module):
             attention_kwargs=attention_kwargs,
             graph_hop=graph_hop,
             graph_edge=graph_edge,
+            tree_mask=ancestor_mask_t,
         )
 
         # 把静止的joint替换一下.

@@ -101,7 +101,7 @@ def plot_pose_grid_4x8(
     titles=None,
     azim=60,
     elev=15,
-    zoo_root="/home/ma-user/work/g00826954/projects/proj_4d/TripoSG/dataset/zoo1030/bvh",
+    zoo_root="./datasets/zoo1030/bvh",
 ):
     """
     Plot up to 32 poses in a fixed 4x8 grid.
