@@ -12,6 +12,15 @@ from . import bvh as BVH
 from .common import parent_to_kinematic_tree
 import shutil
 
+
+def _ffmpeg_exe():
+    """优先用 imageio-ffmpeg 自带的 ffmpeg(pip 即有,无需系统安装);回退 PATH。"""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
 def plot_bvh_compare(
     pred_bvh_path: str,
     gt_bvh_path: str,
@@ -602,7 +611,7 @@ def plot_pose_compare_from_npy(
     # Concatenate videos
     # =========================================================
     if save_type == "mp4":
-        ffmpeg_path = shutil.which("ffmpeg")
+        ffmpeg_path = _ffmpeg_exe()
         if ffmpeg_path is None:
             print("[WARN] ffmpeg not found. Separate videos were saved, but concatenation was skipped.")
         else:
@@ -726,7 +735,7 @@ def convert_images_to_video(image_dir, video_path, fps=20, crf=18, preset="slow"
         pattern = os.path.join(image_dir, "*.jpeg")
 
     cmd = [
-        "ffmpeg",
+        _ffmpeg_exe() or "ffmpeg",
         "-y",
         "-framerate", str(fps),
         "-pattern_type", "glob",

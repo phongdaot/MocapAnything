@@ -49,7 +49,7 @@ A reference frame from a matching species guides the per-species skeleton and sc
 Clone the repo, grab the weights + demo data from HuggingFace, and run the bundled examples (or your own videos) end-to-end — no dataset preprocessing required.
 
 ```bash
-pip install torch torchvision numpy trimesh pyyaml tqdm huggingface_hub pillow imageio imageio-ffmpeg transformers gradio
+pip install torch torchvision numpy opencv-python pillow matplotlib scipy scikit-image trimesh roma pyyaml tqdm huggingface_hub transformers gradio imageio-ffmpeg
 
 # Weights → ./checkpoints/   ·   Demo data (~160 MB, 1-frame references) → ./demo/data/
 hf download kehong/MoCapAnythingV2-weights --local-dir ./checkpoints
@@ -62,7 +62,7 @@ python inference/video2pose2rot.py --config demo/configs/demo_zoo.yaml
 python demo/app.py            # http://localhost:7860
 ```
 
-> Rendering requires a Blender binary (4.x/5.x) on `PATH` — see [RUN.md](RUN.md) for the `blender_mocapanything.sh` wrapper and env vars. Checkpoints and datasets live on HuggingFace; only code ships in this repo. The background remover (`briaai/RMBG-1.4`) and DINOv2 auto-download on first run.
+> The 3D mesh render needs a portable [Blender](https://www.blender.org/download/) build (4.x/5.x): extract it and `export BLENDER_BIN=/path/to/blender` — without it you still get pose `.npy` + BVH + skeleton videos. Checkpoints and datasets live on HuggingFace; only code ships in this repo. The background remover (`briaai/RMBG-1.4`) and DINOv2 auto-download on first run. If torch complains your NVIDIA driver is too old, install a build matching your driver from [pytorch.org](https://pytorch.org/get-started/locally/) (tested: `torch==2.9.0`).
 
 ## Install & Run
 

@@ -242,6 +242,7 @@ def extract_and_compare_image_features_with_rmbg(
 
     # 1. Preprocess images using prepare_image + RMBG
     img_pil_list = []
+    first_err = None
     for image_file in img_files:
         try:
             pil = prepare_image(
@@ -249,7 +250,16 @@ def extract_and_compare_image_features_with_rmbg(
             )
             img_pil_list.append(pil)
         except Exception as e:
+            first_err = first_err or e
             print(f"Failed to process {image_file}: {e}")
+    if not img_pil_list:
+        # 全部帧失败 → 直接给出真实原因(常见:torch CUDA wheel 与显卡驱动不匹配),
+        # 否则会在下游报隐晦的 torch.cat empty-list 错误。
+        raise RuntimeError(
+            f"All {len(img_files)} frames failed preprocessing in {image_folder}. "
+            f"First error: {first_err}. If it mentions the NVIDIA driver being too old, "
+            f"install a torch build matching your driver (see https://pytorch.org/get-started/locally/)."
+        )
 
     # 2. Extract features using pipeline's DINO model
     all_embeds = []

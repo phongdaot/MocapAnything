@@ -22,13 +22,16 @@ A reference frame (a single pose from a matching species) is used to guide the p
 
 Clone the repo, grab the weights + demo data from HuggingFace, and you can run the bundled examples (or your own videos) end-to-end — no dataset preprocessing required.
 
-**1. Clone + environment**
+**1. Clone + environment** (Python ≥ 3.10 recommended)
 ```bash
 git clone https://github.com/phongdaot/MocapAnything.git
 cd MocapAnything
-pip install torch torchvision numpy trimesh pyyaml tqdm tensorboard huggingface_hub pillow imageio imageio-ffmpeg transformers gradio
+pip install torch torchvision numpy opencv-python pillow matplotlib scipy scikit-image \
+    trimesh roma pyyaml tqdm huggingface_hub transformers gradio imageio-ffmpeg
 # TripoSG is only needed for the V1 video2mesh baseline; the V2 demo does not require it.
+# (Alternatively `pip install -r requirements.txt` reproduces the exact tested environment.)
 ```
+> **PyTorch/CUDA:** pip's default `torch` wheel targets the newest CUDA and may fail on older drivers with `The NVIDIA driver on your system is too old` (which then surfaces as `torch.cat(): expected a non-empty list of Tensors` during feature extraction). If you hit that, install a build matching your driver from [pytorch.org](https://pytorch.org/get-started/locally/), e.g. `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126`, or use the tested pin `torch==2.9.0`.
 
 **2. Download weights + demo data from HuggingFace**
 ```bash
@@ -42,11 +45,19 @@ hf download kehong/MoCapAnythingV2-data-sample --repo-type dataset --local-dir .
 > The demo ships **1-frame** reference features (only frame 0 of each reference is needed at inference — verified bit-identical to the full features). A full mini-dataset unlocking all **73 species** as retarget targets will be released later; once available, download it into `./datasets/zoo1030/` and it overrides the demo subset by same-name files.
 
 **3. Configure rendering (for 3D mesh output)**
+
+Download a **portable Blender build (4.x / 5.x)** from [blender.org/download](https://www.blender.org/download/) and extract it anywhere — no installation needed. Then point `BLENDER_BIN` to the binary:
 ```bash
-export BLENDER_BIN=/path/to/blender          # Blender 4.x/5.x binary (required for 3D render)
-export MOCAP_ENV_LIB=$CONDA_PREFIX/lib        # optional: adds conda libs to LD_LIBRARY_PATH
-# ffmpeg must be on PATH — it ships with the conda env, or `conda install ffmpeg`
+export BLENDER_BIN=/path/to/blender-4.x-linux-x64/blender   # required for the 3D mesh render
+# ffmpeg is NOT required system-wide — the pipeline uses the binary bundled with the `imageio-ffmpeg` wheel.
 ```
+On **headless servers** Blender may fail with `error while loading shared libraries: libxkbcommon.so.0` (or similar X11/GL libs). Fix either way:
+```bash
+sudo apt install -y libxkbcommon0 libgl1 libxi6 libxrender1      # Debian/Ubuntu
+# …or, without root: point MOCAP_ENV_LIB at any conda env's lib that ships these
+export MOCAP_ENV_LIB=$CONDA_PREFIX/lib
+```
+Without Blender everything still runs — you get the pose `.npy` + BVH + skeleton videos, just no textured mesh render.
 
 **4. Run the bundled examples (command line)**
 ```bash
@@ -55,13 +66,17 @@ export PYTHONPATH=$PWD:$PWD/TripoSG
 python inference/video2pose2rot.py --config demo/configs/demo_zoo.yaml
 # 5 object videos
 python inference/video2pose2rot.py --config demo/configs/demo_obj.yaml
-# 5 in-the-wild animal videos (no GT — conditions on a same-species reference skeleton)
+# in-the-wild animal videos (no GT — conditions on a same-species reference skeleton).
+# 25 videos ship; the 10 whose species have a reference in the mini demo dataset are
+# processed, the rest are skipped with a warning (they unlock with the full dataset).
 python inference/video2pose2rot.py --config demo/configs/demo_wild.yaml
 ```
 Each sequence produces, under `demo_outputs/`:
 - `*_pose_pred.npy`, `*_rot6d_pred.npy` — predicted joint positions and rotations
 - a BVH file — animation-ready joint rotations
 - `*_final.mp4` — a side-by-side of **input video | pose skeleton (2 views) | 3D mesh render (2 views)**
+
+> **What success looks like:** the `expected_results/` folder in the [data-sample repo](https://huggingface.co/datasets/kehong/MoCapAnythingV2-data-sample/tree/main/expected_results) holds reference `*_final.mp4` outputs for five of the wild examples (Chicken, Dog, Eagle, Jaguar, Leopard) — your runs should look the same.
 
 **5. Interactive web demo (Gradio)**
 ```bash
@@ -101,7 +116,7 @@ MocapAnything/
 
 2. Create a Python environment and install PyTorch (CUDA build matching your hardware) plus the usual ML stack:
    ```bash
-   pip install torch torchvision numpy trimesh pyyaml tqdm tensorboard huggingface_hub pillow
+   pip install -r requirements.txt   # or the minimal list from Quick Start, plus tensorboard for training
    ```
 
 3. Install the TripoSG dependency used by the `video2mesh` pipeline (see the TripoSG repository for details) and place it on your `PYTHONPATH` so `from TripoSG.triposg... ` imports resolve.
