@@ -186,6 +186,24 @@ if __name__ == '__main__':
         default='',
         help='Path to .npy file include camera trajectory'
     )
+    # ------------------ Render speed knobs (optional; defaults keep original behavior) --------
+    parser.add_argument(
+        '--samples',
+        type=int,
+        default=128,
+        help='Cycles samples per pixel (default 128, unchanged).'
+    )
+    parser.add_argument(
+        '--fast',
+        action='store_true',
+        help='Fast mode: OptiX denoiser on + GPU-only devices (drop CPU from hybrid).'
+    )
+    parser.add_argument(
+        '--resolution',
+        type=int,
+        default=0,
+        help='Square render resolution in px. 0 = keep scene default (unchanged).'
+    )
 
     args = parser.parse_args(argv)
     print('args:{0}'.format(args))
@@ -197,14 +215,34 @@ if __name__ == '__main__':
 
     # Render Optimizations
     bpy.context.scene.render.use_persistent_data = True
-    bpy.context.scene.cycles.samples = 128
+    bpy.context.scene.cycles.samples = args.samples
+
+    if args.resolution and args.resolution > 0:
+        # 输出后会被缩到 400 高拼进对比图,渲更小分辨率是无损提速。
+        bpy.context.scene.render.resolution_x = args.resolution
+        bpy.context.scene.render.resolution_y = args.resolution
+        bpy.context.scene.render.resolution_percentage = 100
+
+    if args.fast:
+        # Fast mode: OptiX denoiser lets low samples look like high samples.
+        bpy.context.scene.cycles.use_denoising = True
+        try:
+            bpy.context.scene.cycles.denoiser = 'OPTIX'
+        except Exception:
+            bpy.context.scene.cycles.denoiser = 'OPENIMAGEDENOISE'
 
     bpy.context.scene.cycles.device = 'GPU'
     bpy.context.preferences.addons['cycles'
                                   ].preferences.compute_device_type = 'CUDA'
     bpy.context.preferences.addons['cycles'].preferences.get_devices()
     for d in bpy.context.preferences.addons['cycles'].preferences.devices:
-        d['use'] = 1  # Using all devices, include GPU and CPU
+        # Fast mode: GPU-only (drop CPU) to avoid CPU oversubscription across
+        # parallel per-GPU render processes. Default: keep hybrid GPU+CPU.
+        if args.fast:
+            _is_cpu = getattr(d, 'type', '') == 'CPU'
+            d['use'] = 0 if _is_cpu else 1
+        else:
+            d['use'] = 1  # Using all devices, include GPU and CPU
 
     scene_name = args.scene.split('/')[-1].replace('.blend', '')
     print('scene name:{0}'.format(scene_name))

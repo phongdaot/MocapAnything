@@ -4,8 +4,6 @@ addict==2.4.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
-# Editable install with no version control (animatrix==0.2.1)
-# -e /home/ma-user/work/g00826954/projects/proj_4d/multimodal-motion-generation-animatrix
 annotated-types==0.7.0
 antlr4-python3-runtime==4.9.3
 anyio==4.12.1
@@ -37,7 +35,6 @@ dill==0.4.0
 diso==0.1.4
 easydict==1.13
 einops==0.8.1
-esdk-obs-python==3.23.12
 evaluate==0.4.6
 exceptiongroup==1.3.1
 filelock==3.20.0
@@ -53,7 +50,6 @@ h11==0.16.0
 hf-xet==1.2.0
 httpcore==1.0.9
 httpx==0.28.1
-huaweicloudsdkcore==3.1.94
 huggingface-hub==0.36.0
 idna==3.11
 ijson==3.5.0
@@ -67,9 +63,6 @@ joblib==1.5.3
 kiwisolver==1.4.9
 lazy_loader==0.4
 lxml==5.1.0
-ma-cli @ https://cnsouth1-modelarts-sdk.obs.cn-south-1.myhuaweicloud.com/modelarts/ma-cli/ma_cli-latest-py3-none-any.whl
-ma_mindstudio_insight @ file:///modelarts/tools/visualization/ma_mindstudio_insight/dist/ma_mindstudio_insight-1.0.0-py3-none-any.whl
-ma_tensorboard @ file:///modelarts/tools/visualization/ma_tensorboard/dist/ma_tensorboard-1.0.0-py3-none-any.whl
 Markdown==3.9
 markdown-it-py==3.0.0
 MarkupSafe==3.0.3
@@ -77,9 +70,7 @@ matplotlib==3.7.3
 mdurl==0.1.2
 mmengine==0.10.7
 mock==5.1.0
-modelarts==1.4.28
 mpmath==1.3.0
-msprof-analyze==8.3.0b4
 multidict==6.7.1
 multiprocess==0.70.18
 murmurhash==1.0.15
@@ -153,7 +144,6 @@ SQLAlchemy==2.0.48
 srsly==2.5.2
 sympy==1.14.0
 tabulate==0.9.0
-tb-graph-ascend @ https://cnnorth7-modelarts-sdk.obs.cn-north-7.ulanqab.huawei.com/modelarts/tb_graph_ascend/tb_graph_ascend-1.0.0-py3-none-any.whl
 tenacity==8.2.2
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2

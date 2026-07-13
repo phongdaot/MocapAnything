@@ -18,6 +18,64 @@ The pipeline is composed of several trainable stages that can be run independent
 
 A reference frame (a single pose from a matching species) is used to guide the per-species skeleton and scale, enabling generalization across unseen animals.
 
+## 🚀 Quick Start — run the demo
+
+Clone the repo, grab the weights + demo data from HuggingFace, and you can run the bundled examples (or your own videos) end-to-end — no dataset preprocessing required.
+
+**1. Clone + environment**
+```bash
+git clone https://github.com/phongdaot/MocapAnything.git
+cd MocapAnything
+pip install torch torchvision numpy trimesh pyyaml tqdm tensorboard huggingface_hub pillow imageio imageio-ffmpeg transformers gradio
+# TripoSG is only needed for the V1 video2mesh baseline; the V2 demo does not require it.
+```
+
+**2. Download weights + demo data from HuggingFace**
+```bash
+# Weights → ./checkpoints/   (the end-to-end model)
+hf download kehong/MoCapAnythingV2-weights --local-dir ./checkpoints
+# The background remover (briaai/RMBG-1.4) and DINOv2 (facebook/dinov2-large) auto-download from HuggingFace on first run.
+
+# Demo data (~160 MB: 15 example videos + mini zoo/obj datasets with 1-frame reference features)
+hf download kehong/MoCapAnythingV2-data-sample --repo-type dataset --local-dir ./demo/data
+```
+> The demo ships **1-frame** reference features (only frame 0 of each reference is needed at inference — verified bit-identical to the full features). A full mini-dataset unlocking all **73 species** as retarget targets will be released later; once available, download it into `./datasets/zoo1030/` and it overrides the demo subset by same-name files.
+
+**3. Configure rendering (for 3D mesh output)**
+```bash
+export BLENDER_BIN=/path/to/blender          # Blender 4.x/5.x binary (required for 3D render)
+export MOCAP_ENV_LIB=$CONDA_PREFIX/lib        # optional: adds conda libs to LD_LIBRARY_PATH
+# ffmpeg must be on PATH — it ships with the conda env, or `conda install ffmpeg`
+```
+
+**4. Run the bundled examples (command line)**
+```bash
+export PYTHONPATH=$PWD:$PWD/TripoSG
+# 5 zoo videos (self-driven): predict pose+rotation, render 3D
+python inference/video2pose2rot.py --config demo/configs/demo_zoo.yaml
+# 5 object videos
+python inference/video2pose2rot.py --config demo/configs/demo_obj.yaml
+# 5 in-the-wild animal videos (no GT — conditions on a same-species reference skeleton)
+python inference/video2pose2rot.py --config demo/configs/demo_wild.yaml
+```
+Each sequence produces, under `demo_outputs/`:
+- `*_pose_pred.npy`, `*_rot6d_pred.npy` — predicted joint positions and rotations
+- a BVH file — animation-ready joint rotations
+- `*_final.mp4` — a side-by-side of **input video | pose skeleton (2 views) | 3D mesh render (2 views)**
+
+**5. Interactive web demo (Gradio)**
+```bash
+export PYTHONPATH=$PWD:$PWD/TripoSG
+export BLENDER_BIN=/path/to/blender
+python demo/app.py            # open http://localhost:7860
+```
+The app has two tabs:
+
+- **🎯 Mocap · Retarget** — pick an example video (or **drag-and-drop your own**), choose a **target species** to retarget onto, and click **Run**. The result shows the pose skeleton and the 3D render together, with the `.npy` predictions available for download. The species dropdown lists every reference under your data directory (up to 73 with the full mini-dataset).
+- **💃 Dance Anything** — drop a dance video **with music**: SAM2 auto-segments it into person layers, you click the dancer, pick a target character, and **Run** — the character performs the dance, re-muxed with the original audio.
+
+> The Dance tab needs **SAM2** (optional): `pip install "sam2 @ git+https://github.com/facebookresearch/sam2.git"`. Weights (`facebook/sam2-hiera-large`) auto-download from HuggingFace on first use. If SAM2 is not installed, the Dance tab falls back to the RMBG background remover; the Mocap tab does not need it.
+
 ## Repository Layout
 
 ```
@@ -37,7 +95,7 @@ MocapAnything/
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/animotionlab26/MocapAnything.git
+   git clone https://github.com/phongdaot/MocapAnything.git
    cd MocapAnything
    ```
 
@@ -66,12 +124,12 @@ datasets/zoo1030/
 ├── npz_mesh_normed/                  # Normalized mesh latents
 ├── npz_train_image_only/             # Precomputed image embeddings
 ├── species_info_dict.npy             # Per-species skeleton / T5 embeddings / adjacency
-├── selected_test_split1010.json      # Train/seen/rare/unseen splits
-└── cache/
-    └── species_fps_memory_yAll/      # FPS-sampled per-species memory banks
+├── selected_test_split_release.json     # Train/seen/rare/unseen splits (released split)
+├── characters/                       # Per-species mesh + skinning (for rendering / retargeting)
+└── cache/                            # Per-species scale cache
 ```
 
-Use `preprocess/preprocess_data.py` to build mesh and image caches from raw sequences, and `preprocess/species_fps_memory.py` to generate per-species memory banks used by `pose2rot`.
+Use `preprocess/preprocess_data.py` to build mesh and image caches from raw sequences. The released end-to-end model trains without FPS memory banks (it conditions on the reference frame directly), so `num_memory: -1` in the config; per-species memory banks are only needed for the standalone `pose2rot` variants.
 
 ## Training
 
@@ -79,22 +137,35 @@ Each stage has its own entrypoint and YAML config. All options — optimizer, sc
 
 ```bash
 # Video → Pose
-python -m train.video2pose --config configs/train_video2pose.yaml
+python -m train.video2pose --config configs/train/train_video2pose.yaml
 
 # Mesh → Pose
-python -m train.mesh2pose --config configs/train_mesh2pose.yaml
+python -m train.mesh2pose --config configs/train/train_mesh2pose.yaml
 
 # Pose → Rotation
-python -m train.pose2rot --config configs/train_pose2rot.yaml
+python -m train.pose2rot --config configs/train/train_pose2rot.yaml
 
-# End-to-end Video → Pose → Rotation (joint fine-tune)
-python -m train.video2pose2rot --config configs/train_video2pose2rot.yaml
+# End-to-end Video → Pose → Rotation (joint fine-tune, single dataset)
+python -m train.video2pose2rot --config configs/train/train_video2pose2rot.yaml
 
 # Video → Mesh (TripoSG temporal)
-python -m train.video2mesh --config configs/train_video2mesh.yaml
+python -m train.video2mesh --config configs/train/train_video2mesh.yaml
 ```
 
-Checkpoints are written under `output.checkpoint_root` (e.g. `./checkpoints/video2pose/<exp>/`), along with TensorBoard logs and periodic comparison visualizations. The best checkpoint is selected by `eval.best_metric_split` / `eval.best_metric_name` (e.g. `seen` + `mpjpe` for pose, `rot_l1` for rotation).
+**Recommended: end-to-end multi-dataset training (the released recipe).**
+Trains `video2pose2rot` jointly on `zoo1030 + obj1k` with reference-enhancement, scheduled teacher forcing (`pose_source_mode: mix`, 0.1→1.0 warmup over 20 epochs), and the released loss weights. All hyper-parameters live in `configs/train/train_video2pose2rot_multidata.yaml`.
+
+```bash
+# 8-GPU (adjust NGPU / CUDA_VISIBLE_DEVICES for your machine)
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NGPU=8 bash train_multidata.sh
+# equivalently:
+torchrun --nproc_per_node=8 --master_port=29530 \
+    -m train.video2pose2rot_multidata \
+    --config configs/train/train_video2pose2rot_multidata.yaml
+```
+Training auto-resumes from the latest checkpoint in the experiment directory if interrupted (just re-run the same command).
+
+Checkpoints are written under `output.checkpoint_root` (e.g. `./checkpoints/video2pose2rot/<exp>/`), along with TensorBoard logs and periodic comparison visualizations. The best checkpoint is selected by `eval.best_metric_split` / `eval.best_metric_name` (e.g. `seen` + `mpjpe` for pose, `rot_l1` for rotation).
 
 Distributed multi-GPU training is supported through `utils/dist_utils.py`; launch with `torchrun` to enable.
 
@@ -106,16 +177,16 @@ Inference scripts read the same YAML configs (inference variants) and operate on
 
 ```bash
 # Video → Mesh
-python -m inference.video2mesh --config configs/inference_video2mesh.yaml
+python -m inference.video2mesh --config configs/inference/inference_video2mesh.yaml
 
 # Mesh → Pose
-python -m inference.mesh2pose --config configs/inference_mesh2pose.yaml
+python -m inference.mesh2pose --config configs/inference/inference_mesh2pose.yaml
 
 # Video → Pose
-python -m inference.video2pose --config configs/inference_video2pose.yaml
+python -m inference.video2pose --config configs/inference/inference_video2pose.yaml
 
 # End-to-end Video → Pose → Rotation (outputs BVH)
-python -m inference.video2pose2rot --config configs/inference_video2pose2rot.yaml
+python -m inference.video2pose2rot --config configs/inference/inference_video2pose2rot.yaml
 ```
 
 Outputs are written to `output.save_dir` and include predicted pose `.npz` files, rotation sequences, BVH files, and (if Blender is configured) rendered comparison videos.

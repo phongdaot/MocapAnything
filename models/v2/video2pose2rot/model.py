@@ -73,12 +73,15 @@ class Video2Pose2RotModel(nn.Module):
         pose_source_mode: str = "pred",
         pose_mix_prob: float = 1.0,
         detach_pred_pose_for_rot: bool = False,
+        stage_cb=None,
     ):
         gt_position = batch["position"]   # [B,T,J,3]
 
         # -------------------------
         # stage1: video2pos
         # -------------------------
+        if stage_cb is not None:
+            stage_cb("v2p")
         if attention_kwargs is None or not self.video2pos_accepts_attention_kwargs:
             pred_position = self.video2pos(batch)
         else:
@@ -101,6 +104,8 @@ class Video2Pose2RotModel(nn.Module):
         # -------------------------
         # stage2: pos2rot
         # -------------------------
+        if stage_cb is not None:
+            stage_cb("p2r")
         pos2rot_out = self.pos2rot(
             batch=batch,
             pose_override=pose_for_rot,

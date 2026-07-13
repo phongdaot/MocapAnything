@@ -1,0 +1,161 @@
+
+### train_video2pose2rot_multidata.yaml ###
+# 多数据集(zoo1030 + obj1k [+ mobjaverse])联合训练。
+# 超参为发布训练配方。
+# 加第三个数据集(mobjaverse, setting2):在 data.train_sets 和 data.test_sets 各 append 一条即可。
+name: Video2Pose2Rot multidata training
+
+runtime:
+  device: cuda
+  seed: 42
+  debug: false
+
+output:
+  checkpoint_root: ./checkpoints/video2pose2rot
+
+experiment:
+  exp: video2pose2rot_multidata_align
+
+model:
+  target: models.v2.video2pose2rot.model.Video2Pose2RotModel
+  params:
+    v2p_cfg:
+      target: models.v2.video2pose.model.RefGuidedVideo2PoseModel
+      params:
+        q_dim: 256
+        num_layers: 8
+        num_heads: 8
+        ref_layers: 4
+        img_dim: 1024
+        num_joints: 150
+        use_graph_ref_outer: false
+        use_graph_ref_inner: true
+        use_graph_temporal_outer: false
+        use_graph_temporal_inner: true
+        use_joint_embed: true
+
+    p2r_cfg:
+      target: models.v2.pose2rot.model.Pose2RotMemoryRestModel
+      params:
+        q_dim: 256
+        rest_layers: 4
+        pose_layers: 4
+        memory_layers: 4
+        decoder_layers: 8
+        num_heads: 8
+        joint_embed_dim: 768
+        temporal_window: 2
+        temporal_dropout: 0.1
+        decoder_cond_mode: add
+        pose_rest_film: true
+        memory_rest_film: true
+        decoder_rest_film: true
+        pose_use_graph: true
+        use_grad_checkpoint: false
+        decoder_use_cross_layers: 6
+        num_memory: -1         # 对齐发布配方:用 ref 帧构 1 条 memory(无 fps memory 时与 None 等价)
+
+  attention_kwargs:
+    seq_len: 32
+    selfatt_temporal_layer_flag: []
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 5
+    crossatt2_slidwindow: 5
+
+train:
+  batch_size: 2                # 对齐发布配方
+  epochs: 60                   # 对齐发布配方
+  grad_accum_steps: 1          # 对齐发布配方
+  lr: 0.0001
+  max_ckpt: 2
+  num_workers_train: 8         # 对齐发布配方
+  test_every: 2                # 对齐发布配方
+  pretrain_ckpt: null
+
+  pose_input:
+    pose_source_mode: "mix"
+    pose_mix_start_prob: 0.1
+    pose_mix_end_prob: 1.0      # 对齐发布配方
+    pose_mix_warmup_epochs: 20  # 对齐发布配方
+    pose_mix_schedule: "linear"
+    detach_pred_pose_for_rot: false   # 对齐发布配方(rot loss 梯度回流 stage1)
+
+  loss:
+    rot_loss_type: smooth_l1
+    vel_loss_type: smooth_l1
+    acc_loss_type: smooth_l1
+    pose_loss_type: l2
+    pose_vel_loss_type: l1
+
+  weight:
+    root_wt: 0.2               # 对齐发布配方(0.1→0.2)
+    root_rot_v_wt: 0.1         # 对齐发布配方(root 角速度 loss)
+    fk_wt: 0.0
+    vel_wt: 1.0
+    acc_wt: 0.0
+    rot_wt: 1.0
+    pose_wt: 1.0
+    pose_vel_wt: 0.0
+
+  vis_every: 999
+  weight_decay: 0.0
+
+eval:
+  batch_size: 1
+  num_workers: 2
+  preload_all: false
+  # best ckpt 判据:某个 (test_set, split) 的指标,越小越好
+  best_metric:
+    test_set: zoo1030
+    split: seen
+    name: rot_l1
+
+data:
+  seq_len: 32
+  mmap: true
+  cache_scale: true
+  limit_species_debug: []
+  preload_all: false
+
+  # 训练集:每条建一个 AnySpeciesPoseDataset(split_mode=train) 再 ConcatDataset
+  train_sets:
+    - name: zoo1030
+      bvh_dir: datasets/zoo1030/bvh
+      split_json: datasets/zoo1030/selected_test_split_release.json
+      memory_pkl_path: null
+      ref_enhance: cross_seq        # 对齐发布配方(zoo:同物种不同序列)
+    - name: obj1k
+      bvh_dir: datasets/obj1k/bvh
+      split_json: datasets/obj1k/select_test_obj1k.json
+      memory_pkl_path: null
+      blocklist: datasets/obj1k/obj1k_blocklist.txt   # 对齐发布配方(剔坏样本)
+      ref_enhance: cross_angle      # 对齐发布配方(obj:同物体不同角度)
+    # setting2 再加:
+    # - name: mobjaverse
+    #   bvh_dir: datasets/mobjaverse/bvh
+    #   split_json: datasets/mobjaverse/selected_test_split_mobjaverse.json
+    #   memory_pkl_path: null
+
+  # 测试集:每 (test_set, split) 建一个 split_mode=test 实例,分别报告
+  test_sets:
+    - name: zoo1030
+      bvh_dir: datasets/zoo1030/bvh
+      split_json: datasets/zoo1030/selected_test_split_release.json
+      splits: ["seen", "rare", "unseen"]
+      memory_pkl_path: null
+      character_dir: datasets/zoo1030/characters
+    - name: obj1k
+      bvh_dir: datasets/obj1k/bvh
+      split_json: datasets/obj1k/select_test_obj1k.json
+      splits: ["seen"]
+      memory_pkl_path: null
+      character_dir: datasets/obj1k/characters
+      blocklist: datasets/obj1k/obj1k_blocklist.txt   # 对齐发布配方(测试集同步剔坏样本)
+    # setting2 再加(注意 mobjaverse 的测试序列全在 unseen 组):
+    # - name: mobjaverse
+    #   bvh_dir: datasets/mobjaverse/bvh
+    #   split_json: datasets/mobjaverse/selected_test_split_mobjaverse.json
+    #   splits: ["unseen"]
+    #   memory_pkl_path: null
+    #   character_dir: datasets/mobjaverse/characters

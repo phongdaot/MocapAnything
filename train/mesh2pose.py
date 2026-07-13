@@ -528,7 +528,12 @@ def train_mesh2pose(cfg):
 
 
 if __name__ == "__main__":
-    cfg = load_yaml_config("configs/train/train_mesh2pose.yaml")
+    import argparse
+    parser = argparse.ArgumentParser(description="Training script for Mesh2Pose")
+    parser.add_argument("--config", type=str, default="configs/train/train_mesh2pose.yaml", help="Path to the YAML config file")
+    args = parser.parse_args()
+
+    cfg = load_yaml_config(args.config)
     train_mesh2pose(cfg)
     
     

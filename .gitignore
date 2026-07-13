@@ -90,3 +90,19 @@ results/
 
 # External git
 TripoSG/
+# ---- 本次 release 整理:渲染产物 / 备份 / 内部 eval 工具 ----
+# 大体积渲染输出(69G,走 HF 或单独托管,不进 git)
+demo_outputs/
+# 历史备份 / 临时运行目录
+_prev_runs_*/
+_release_infer_orig_bak/
+_tb_baseline_*/
+_align_monitor/
+# 内部 democheck/eval 编排脚本与配置(非公开 demo 交付物;均以 _ 开头)
+demo/_*.sh
+demo/_*.py
+demo/configs/_*.yaml
+# demo mini 数据集走 HuggingFace(用户 overlay),不进 git
+demo/data/
+# 内部对齐测试(引用 lab 私有路径,非公开)
+tests/test_train_alignment.py

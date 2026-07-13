@@ -164,20 +164,30 @@ class SimpleAttnProcessor:
         heads = attn.heads
         head_dim = D // heads
 
-        query = query.view(B, heads, N, head_dim)
-        key = key.view(B, heads, -1, head_dim)
-        value = value.view(B, heads, -1, head_dim)
+        # 多头拆分:先 [B,N,heads,head_dim] 再 permute(与 lab 一致;
+        # 旧写法 view(B,heads,N,head_dim) 打乱 N/heads 内存布局 → 与 lab ckpt 不匹配)
+        query = query.view(B, N, heads, head_dim).permute(0, 2, 1, 3)
+        key = key.view(B, -1, heads, head_dim).permute(0, 2, 1, 3)
+        value = value.view(B, -1, heads, head_dim).permute(0, 2, 1, 3)
 
         attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (head_dim ** 0.5)
 
-        # === 加入 joint_mask ===
+        # === 加入 joint_mask（仅 self-attn,N=J）===
         if joint_mask is not None and encoder_hidden_states is None:
-            # 仅在 self-attn 时使用（N=J）
             attn_scores = attn_scores.masked_fill(
                 ~joint_mask.unsqueeze(1).unsqueeze(2), float('-inf')
             )
 
+        # 避免整行 -inf 导致 NaN(与 lab 一致)
+        invalid_rows = torch.isinf(attn_scores).all(dim=-1, keepdim=True)
+        attn_scores = torch.where(invalid_rows, torch.zeros_like(attn_scores), attn_scores)
+
         attn_probs = attn_scores.softmax(dim=-1)
+
+        # query mask:无效 query 行归零(与 lab 一致)
+        if joint_mask is not None and encoder_hidden_states is None:
+            attn_probs = attn_probs * joint_mask.unsqueeze(1).unsqueeze(-1).float()
+
         out = torch.matmul(attn_probs, value)
         out = out.permute(0, 2, 1, 3).reshape(B, N, D)
         return attn.to_out(out)

@@ -49,8 +49,11 @@ def angle_velocity_L1(pred_rot6d, gt_rot6d, mask=None):
     velocity_error_matrix = pred_vel_matrix @ gt_vel_matrix.transpose(0, 1, 2, 4, 3)
 
     # to rotvec
+    _vel_flat = velocity_error_matrix.reshape(-1, 3, 3)
+    if _vel_flat.shape[0] == 0:      # 空(无有效关节/帧<2):scipy R.from_matrix 会崩,返回 nan 交上游跳过
+        return float("nan")
     vel_rotvec = R.from_matrix(
-        velocity_error_matrix.reshape(-1, 3, 3)
+        _vel_flat
     ).as_rotvec()
 
     # print('vel_rotvec shape:', vel_rotvec.shape)
@@ -295,6 +298,14 @@ def compute_rot_loss(model_out, batch, weight_cfg, rot_criterion, vel_criterion,
         loss_root = masked_loss(pred_rot6d, gt_rot6d, root_mask, rot_criterion)
         loss_dict["loss_root"] = loss_root
         total_loss = total_loss + weight_cfg["root_wt"] * loss_root
+
+    # 对齐发布配方:root 关节的角速度 loss(rot6d 速度),权重 root_rot_v_wt
+    if weight_cfg.get("root_rot_v_wt", 0.0) > 0:
+        root_mask = torch.zeros_like(joint_mask)
+        root_mask[:, 0] = True
+        loss_root_rot_v = rot6d_vel_loss(pred_rot6d, gt_rot6d, root_mask, vel_criterion)
+        loss_dict["loss_root_rot_v"] = loss_root_rot_v
+        total_loss = total_loss + weight_cfg["root_rot_v_wt"] * loss_root_rot_v
 
     loss_dict["total_loss"] = total_loss
     return total_loss, loss_dict
