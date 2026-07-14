@@ -40,7 +40,9 @@ def _fk_joints(offsets, parents, quats_wxyz, root_pos):
 
 
 # ---------- shared projection ----------
-def _projector(all_pts, size, yaw_deg=25.0, margin=0.86):
+def _projector(all_pts, size, yaw_deg=0.0, margin=0.86):
+    # yaw=0 ≡ pipeline 的 camera 视角(与 *_pose_compare_camera 同向,实测对齐);
+    # 传非 0 可得 3/4 视角,但会偏离输入相机朝向。
     a = np.radians(yaw_deg); ca, sa = np.cos(a), np.sin(a)
     R = np.array([[ca, 0, sa], [0, 1, 0], [-sa, 0, ca]], np.float32)
     P = all_pts @ R.T
