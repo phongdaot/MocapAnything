@@ -76,7 +76,7 @@ Each sequence produces, under `demo_outputs/`:
 - a BVH file — animation-ready joint rotations
 - `*_final.mp4` — a side-by-side of **input video | pose skeleton (2 views) | 3D mesh render (2 views)**
 
-> **What success looks like:** the `expected_results/` folder in the [data-sample repo](https://huggingface.co/datasets/kehong/MoCapAnythingV2-data-sample/tree/main/expected_results) holds reference `*_final.mp4` outputs for five of the wild examples (Chicken, Dog, Eagle, Jaguar, Leopard) — your runs should look the same.
+> **What success looks like:** the `expected_results/` folder in the [data-sample repo](https://huggingface.co/datasets/kehong/MoCapAnythingV2-data-sample/tree/main/expected_results) holds reference `*_final.mp4` outputs under `wild/`, `zoo/` and `obj/` (5 examples each) — your runs should look the same.
 
 **5. Interactive web demo (Gradio)**
 ```bash
