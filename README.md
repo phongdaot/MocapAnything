@@ -23,6 +23,11 @@
 - **[TODO]** — 🌐 Hosted online demo (HuggingFace Space) — try it in the browser, no setup.
 - **[TODO]** — 📦 Full training datasets released on HuggingFace.
 
+<p align="center">
+  <img src="assets/demo_app.png" width="92%" alt="MocapAnything V2 interactive demo — pick a video, pick a target species/object, run: pose skeleton + 3D mesh render, with retargeting and a Dance Anything tab" />
+</p>
+<p align="center"><sub>🎮 The interactive demo — <code>python demo/app.py</code>, pick a video + target, hit Run.</sub></p>
+
 ## Highlights
 
 - 🔗 **Fully end-to-end.** Video → Pose → Rotation jointly optimized — no analytical IK in the loop.
