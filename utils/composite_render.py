@@ -150,7 +150,7 @@ def render_composite(bvh_pth, char_dir, input_panel_mp4, out_mp4, fps=15, size=3
             jx, jy, jz = proj(joints[f])
             im = Image.new("RGB", (size, size), tuple(int(v * 255) for v in BG))
             dr = ImageDraw.Draw(im)
-            zr = (jz - jz.min()) / (jz.ptp() + 1e-6)
+            zr = (jz - jz.min()) / (float(jz.max() - jz.min()) + 1e-6)  # np2: ndarray.ptp removed
             for a, b in bones:
                 sh = 0.5 + 0.5 * (1 - (zr[a] + zr[b]) / 2)
                 col = (int(90 * sh), int(200 * sh), int(255 * sh))
