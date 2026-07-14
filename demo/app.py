@@ -23,6 +23,12 @@ from preprocess.briarmbg import BriaRMBG
 sys.path.insert(0, os.path.join(REPO, "demo"))
 import dance_utils as du      # noqa: E402  ffmpeg 音视频工具
 import sam_utils as su        # noqa: E402  SAM2 抠人
+from utils.glb_export import export_skinned_glb          # noqa: E402  交互 3D(与 HF Space 同款)
+try:
+    from utils.composite_render import render_composite  # noqa: E402  输入|骨架|网格 合成片
+except Exception as _ce:
+    print(f"[app] composite render unavailable: {_ce}")
+    render_composite = None
 
 BASE_CONFIG = os.path.join(REPO, "demo/configs/demo_zoo.yaml")
 DEVICE = os.environ.get("APP_DEVICE", "cuda:0")
@@ -277,6 +283,35 @@ def term_html(lines, running=False):
             f'<span style="{_S_GRN}">mocap@v2</span>:~$ {body} {cur}</div>')
 
 
+SPACE_URL = "https://huggingface.co/spaces/kehong/MoCapAnythingV2"
+
+
+def _share_html(species, vid_elem="lresmp4"):
+    """share 按钮(与 HF Space 同款):移动端 navigator.share 附带视频文件,桌面回退链接。"""
+    import urllib.parse as up
+    text = f"I just animated a {species} from a video with MoCapAnything V2! 🐾 #MoCapAnythingV2"
+    u = up.quote(SPACE_URL); t = up.quote(text)
+    x = f"https://twitter.com/intent/tweet?text={t}&url={u}&hashtags=MoCapAnythingV2"
+    btn = ("display:inline-flex;align-items:center;gap:6px;padding:8px 16px;margin:4px 6px 0 0;border:0;"
+           "border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;color:#fff;cursor:pointer;")
+    js = ("async function mcaShare(){"
+          f"const v=document.querySelector('#{vid_elem} video');"
+          "const msg=" + repr(text) + ";const url=" + repr(SPACE_URL) + ";"
+          "try{if(v&&v.src){const r=await fetch(v.src);const b=await r.blob();"
+          "const f=new File([b],'mocapanything.mp4',{type:'video/mp4'});"
+          "if(navigator.canShare&&navigator.canShare({files:[f]})){"
+          "await navigator.share({files:[f],text:msg,url:url});return;}}}catch(e){}"
+          "window.open(" + repr(x) + ",'_blank');}")
+    return (f'<script>{js}</script>'
+            '<div style="padding:6px 2px">'
+            '<span style="font-weight:600;margin-right:8px">✨ Share:</span>'
+            f'<button onclick="mcaShare()" style="{btn}background:linear-gradient(90deg,#833ab4,#fd1d1d,#fcb045)">'
+            '📲 Share result video</button>'
+            f'<a href="{x}" target="_blank" style="{btn}background:#000">𝕏 / Twitter</a>'
+            f'<button onclick="navigator.clipboard.writeText(\'{SPACE_URL}\');this.textContent=\'✓ copied\'" '
+            f'style="{btn}background:#e75480">📋 Copy link</button></div>')
+
+
 def run_inference(video_path, species, dset):
     d = DSET[dset]; sp_map = d["sp_map"]
     if not video_path:
@@ -291,7 +326,8 @@ def run_inference(video_path, species, dset):
 
     lines = [f'run --dataset {dset} --species <b>{html.escape(species[:20])}</b>']
     t0 = time.time()
-    yield term_html(lines + [T()["booting"]], True), None, gr.update()
+    _idle6 = (None, None, None, gr.update(), gr.update())
+    yield (term_html(lines + [T()["booting"]], True),) + _idle6
 
     nfr = video_to_frames(video_path, frames_dir)
     lines.append(f"{T()['frames']}: {nfr}")
@@ -304,10 +340,10 @@ def run_inference(video_path, species, dset):
                        bvh_roots=[os.path.join(base, "bvh")],
                        image_roots=[os.path.join(work, "frames")], wild_flag=True)
     cfg["data"]["retarget"].update(ref_seq=ref_seq, ref_idx=0)
-    # 和命令行推理一致:跑 blender 渲染出 _final.mp4(输入|骨架cam|mesh_cam|骨架side|mesh_side)。慢 ~4min。
+    # Blender 可选(装了则出 _final.mp4 写实渲染,~4min;没装自动跳过 → 合成片)
     cfg["output"].update(save_dir=os.path.join(work, "out"), output_tag="app",
                          blender_path=os.path.join(REPO, "blender_mocapanything.sh"))
-    cfg["export_glb"] = False
+    cfg["export_glb"] = True   # 交互 3D(与 HF Space 同款)
 
     # 每阶段记录 (名称, 起始时间);展示时算每阶段耗时(下一阶段起始 - 本阶段起始;最后阶段用当前时间)
     state = {"log": [], "done": False, "err": None}
@@ -334,31 +370,64 @@ def run_inference(video_path, species, dset):
         return out
 
     while not state["done"]:
-        yield term_html(lines + _stage_lines(True), True), None, gr.update()
+        yield (term_html(lines + _stage_lines(True), True),) + _idle6
         time.sleep(0.2)
     if state["err"]:
         lines += _stage_lines(False)
         lines.append(f'<span style="{_S_ERR}">ERROR: {html.escape(state["err"][:180])}</span>')
-        yield term_html(lines), None, gr.update(); return
+        yield (term_html(lines),) + _idle6; return
     lines += _stage_lines(False)
 
-    # blender 渲染结果 _final.mp4(输入|骨架cam|mesh_cam|骨架side|mesh_side)
-    finals = glob.glob(os.path.join(work, "out", "**", "*_final.mp4"), recursive=True)
-    npys = glob.glob(os.path.join(work, "out", "**", "*_pred.npy"), recursive=True)
-    if not finals:
-        lines.append(f'<span style="{_S_ERR}">未生成渲染 mp4(检查 BLENDER_BIN / ffmpeg)</span>')
-        yield term_html(lines), None, gr.update(); return
     import shutil, zipfile
-    safe_mp4 = os.path.join(work, os.path.basename(finals[0]).replace("#", "_"))
-    shutil.copy2(finals[0], safe_mp4)
+    out_root = os.path.join(work, "out")
+    bvh = next(iter(glob.glob(os.path.join(out_root, "**", "*_rot6d_pred.bvh"), recursive=True)), None)
+    npys = glob.glob(os.path.join(out_root, "**", "*_pred.npy"), recursive=True)
+    char_dir = os.path.join(d["base"], d.get("char_sub", "characters"), species)
+
+    # 交互 3D(inference export_glb 已产出;兜底再导一次)
+    mesh_glb = next(iter(glob.glob(os.path.join(out_root, "**", "*_mesh.glb"), recursive=True)), None)
+    skel_glb = next(iter(glob.glob(os.path.join(out_root, "**", "*_skeleton.glb"), recursive=True)), None)
+    if bvh and not (mesh_glb and skel_glb):
+        try:
+            mesh_glb = os.path.join(work, f"{species[:16]}_mesh.glb")
+            skel_glb = os.path.join(work, f"{species[:16]}_skeleton.glb")
+            export_skinned_glb(bvh, char_dir, mesh_glb, skel_glb, fps=15, validate=False)
+        except Exception as _ge:
+            print(f"[app] glb export failed: {_ge}"); mesh_glb = skel_glb = None
+
+    # 结果视频:Blender _final.mp4(若装了 Blender)> 合成片(输入|骨架|网格,numpy)
+    finals = glob.glob(os.path.join(out_root, "**", "*_final.mp4"), recursive=True)
+    result_mp4 = None
+    if finals:
+        result_mp4 = os.path.join(work, os.path.basename(finals[0]).replace("#", "_"))
+        shutil.copy2(finals[0], result_mp4)
+    elif render_composite is not None and bvh:
+        img_panel = next(iter(glob.glob(os.path.join(out_root, "**", "*_pose_compare_image.mp4"), recursive=True)), None)
+        if img_panel:
+            rc = render_composite(bvh, char_dir, img_panel, os.path.join(work, "composite.mp4"), fps=15)
+            result_mp4 = rc[0] if rc else None
+    if result_mp4 is None:
+        pc = next(iter(glob.glob(os.path.join(out_root, "**", "*_pose_compare.mp4"), recursive=True)), None)
+        if pc:
+            result_mp4 = os.path.join(work, "pose_compare.mp4"); shutil.copy2(pc, result_mp4)
+    if result_mp4 is None:
+        lines.append(f'<span style="{_S_ERR}">no result video</span>')
+        yield (term_html(lines),) + _idle6; return
+
     zpath = os.path.join(work, f"{species[:16]}_result.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(safe_mp4, os.path.basename(safe_mp4))
+        zf.write(result_mp4, os.path.basename(result_mp4))
         for f in npys:
             if f.endswith("_pred.npy"):
                 zf.write(f, os.path.basename(f))
-    lines.append(f'<span style="{_S_GRN}">✔ {T()["done"]} {time.time()-t0:0.1f}s · {nfr} frames · pose mp4 + npy</span>')
-    yield term_html(lines), safe_mp4, gr.update(value=zpath, visible=True)
+        if bvh:
+            zf.write(bvh, os.path.basename(bvh))
+        for g in (mesh_glb, skel_glb):
+            if g and os.path.exists(g):
+                zf.write(g, os.path.basename(g))
+    lines.append(f'<span style="{_S_GRN}">✔ {T()["done"]} {time.time()-t0:0.1f}s · {nfr} frames · mp4 + npy + bvh + glb</span>')
+    yield (term_html(lines), result_mp4, skel_glb, mesh_glb,
+           gr.update(value=zpath, visible=True), gr.update(value=_share_html(species), visible=True))
 
 
 def on_species_select(dset, evt: gr.SelectData):
@@ -555,13 +624,21 @@ def run_dance(ctx, pick_idx, species, dset):
     if failed:
         yield term_html(lines), None, gr.update(); return
 
-    # 3) 合成:原图 | 角色 mesh(camera)+ 配乐回填
+    # 3) 合成:原图 | 角色 mesh(camera)+ 配乐回填。无 Blender → numpy 合成片回退。
     mesh_cam = glob.glob(os.path.join(work, "out", "**", "camera", "*rot6d_pred.mp4"), recursive=True)
-    if not mesh_cam:
-        lines.append(f'<span style="{_S_ERR}">no character render (blender)</span>')
-        yield term_html(lines), None, gr.update(); return
     comp = os.path.join(work, "dance_side.mp4")
-    du.compose_side_by_side([ctx["std"], mesh_cam[0]], comp, height=480, fps=DANCE_FPS)
+    if mesh_cam:
+        du.compose_side_by_side([ctx["std"], mesh_cam[0]], comp, height=480, fps=DANCE_FPS)
+    else:
+        bvh = next(iter(glob.glob(os.path.join(work, "out", "**", "*_rot6d_pred.bvh"), recursive=True)), None)
+        char_dir = os.path.join(d["base"], d.get("char_sub", "characters"), species)
+        rc = None
+        if render_composite is not None and bvh:
+            rc = render_composite(bvh, char_dir, ctx["std"], comp, fps=DANCE_FPS)
+        if not rc:
+            lines.append(f'<span style="{_S_ERR}">no character render (blender/composite)</span>')
+            yield term_html(lines), None, gr.update(); return
+        lines.append('render: <b>composite</b> (no Blender)')
     outp = os.path.join(work, f"dance_{species[:16]}.mp4")
     du.mux_audio(comp, ctx["audio"], outp)
     tag_audio = "+audio" if ctx.get("audio") else "no-audio"
@@ -628,7 +705,17 @@ with gr.Blocks(title="MocapAnything V2 Demo", theme=gr.themes.Soft(), css=_CSS) 
         with gr.Row(equal_height=True):
             video_in = gr.Video(label=_z["in_video"], height=280, scale=1)
             ref_img = gr.Image(label=_z["ref"], height=280, interactive=False, scale=1)
-            result_out = gr.Video(label=_z["result"], height=280, autoplay=True, scale=3)
+            result_out = gr.Video(label=_z["result"], height=280, autoplay=True, loop=True,
+                                  scale=3, elem_id="lresmp4")
+
+        # 交互 3D(与 HF Space 同款,可旋转)+ share
+        with gr.Row(equal_height=True):
+            skel_out = gr.Model3D(label="🦴 3D pose skeleton (drag to rotate) · 3D骨架", height=260,
+                                  clear_color=[0.07, 0.07, 0.09, 1.0], scale=1)
+            mesh_out = gr.Model3D(label="🧊 3D mesh result (drag to rotate) · 3D网格", height=260,
+                                  clear_color=[0.07, 0.07, 0.09, 1.0], scale=1)
+            with gr.Column(scale=1):
+                share_html = gr.HTML(visible=False)
 
         with gr.Row(elem_id="selbar", equal_height=False):
             run_btn = gr.Button(_z["run"], variant="primary", size="lg", scale=2)
@@ -689,7 +776,7 @@ with gr.Blocks(title="MocapAnything V2 Demo", theme=gr.themes.Soft(), css=_CSS) 
     ex_gallery.select(on_example_select, inputs=[ex_ds], outputs=[video_in])
     species_gallery.select(on_species_select, inputs=[ref_ds], outputs=[species_state, sel_label, ref_img])
     run_btn.click(run_inference, inputs=[video_in, species_state, ref_ds],
-                  outputs=[term, result_out, dl_btn])
+                  outputs=[term, result_out, skel_out, mesh_out, dl_btn, share_html])
 
     # ---- Tab2(Dance)交互:上传/点样例 → 自动 SAM 分割 → 点人物层 + 选角色 → Run ----
     dance_video.upload(dance_segment, inputs=[dance_video, dmax],
