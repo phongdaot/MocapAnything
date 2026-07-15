@@ -64,7 +64,8 @@ class DinoPipe:
         self.image_encoder_dinov2 = Dinov2Model.from_pretrained(model_id).to(device, dtype).eval()
 
 def video_to_frames(video_path, out_dir):
-    """用 cv2 把 mp4 抽帧到 out_dir(环境无 ffmpeg CLI),返回帧数。"""
+    """mp4 抽帧到 out_dir,返回帧数。优先 cv2;cv2 无解码后端(某些环境)抽出 0 帧时
+    自动回退 imageio-ffmpeg 自带的 ffmpeg 二进制。"""
     import cv2
     os.makedirs(out_dir, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
@@ -76,6 +77,16 @@ def video_to_frames(video_path, out_dir):
         cv2.imwrite(os.path.join(out_dir, f"{i:05d}.png"), frame)
         i += 1
     cap.release()
+    if i == 0:                               # cv2 缺 mp4 解码 → ffmpeg 回退
+        try:
+            import subprocess, glob as _g
+            import imageio_ffmpeg as _iio
+            subprocess.run([_iio.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", video_path,
+                            "-start_number", "0", os.path.join(out_dir, "%05d.png")],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            i = len(_g.glob(os.path.join(out_dir, "*.png")))
+        except Exception as _fe:
+            print(f"[video_to_frames] ffmpeg fallback failed: {_fe}")
     return i
 
 def find_all_videos(video_roots):
