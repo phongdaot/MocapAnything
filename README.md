@@ -2,7 +2,13 @@
 
 **End-to-End Motion Capture for Arbitrary Skeletons from Monocular Videos**
 
-[Project Page](https://animotionlab.github.io/MoCapAnythingV2/) · [Paper (arXiv)](https://arxiv.org/abs/2604.28130) · [Install & Run](RUN.md)
+[🤗 **Try the live demo**](https://huggingface.co/spaces/kehong/MoCapAnythingV2) · [Project Page](https://animotionlab.github.io/MoCapAnythingV2/) · [Paper (arXiv)](https://arxiv.org/abs/2604.28130) · [Install & Run](RUN.md)
+
+<p align="center">
+  <a href="https://huggingface.co/spaces/kehong/MoCapAnythingV2"><img src="https://img.shields.io/badge/🤗%20Demo-Live%20on%20HF%20Spaces-yellow" alt="Live demo on HuggingFace Spaces" /></a>
+  <a href="https://huggingface.co/kehong/MoCapAnythingV2-weights"><img src="https://img.shields.io/badge/🤗%20Weights-HF%20Hub-blue" alt="Weights on HuggingFace" /></a>
+  <a href="https://arxiv.org/abs/2604.28130"><img src="https://img.shields.io/badge/arXiv-2604.28130-b31b1b" alt="arXiv" /></a>
+</p>
 
 > ⚠️ **Unofficial code release.** This repository is a reimplementation based on the paper — use as a reference, not a reproduction.
 
@@ -20,7 +26,8 @@
 - **[2026-07-13]** — 🏋️ Pretrained weights on HuggingFace (`kehong/MoCapAnythingV2-weights`).
 - **[2026-07-13]** — 🎮 Local interactive demo (`demo/app.py`) + demo data on HuggingFace.
 - **[2026-07-13]** — 💃 Dance Anything tab: dance video (with music) → SAM2 picks the dancer → animal performs the dance with the original audio.
-- **[TODO]** — 🌐 Hosted online demo (HuggingFace Space) — try it in the browser, no setup.
+- **[2026-07-15]** — 🌐 **[Live online demo on HuggingFace Spaces](https://huggingface.co/spaces/kehong/MoCapAnythingV2)** (ZeroGPU, free) — try it in the browser, no setup: interactive 3D pose + mesh, retargeting, and Dance Anything.
+- **[2026-07-15]** — 🖼️ Interactive 3D + shareable **input | skeleton | mesh** clip rendered without Blender (works on Spaces); SAM2 via `transformers`; textured meshes.
 - **[TODO]** — 📦 Full training datasets released on HuggingFace.
 
 <p align="center">
@@ -33,7 +40,7 @@
 - 🔗 **Fully end-to-end.** Video → Pose → Rotation jointly optimized — no analytical IK in the loop.
 - ⚓ **Reference-anchored rotation.** A single reference pose–rotation pair from the target asset defines the rotation coordinate system, turning pose-to-rotation into a well-constrained problem.
 - ⚡ **Mesh-free and fast.** Joints predicted directly from video, ~20× faster than mesh-based pipelines.
-- 🎮 **Interactive web demo.** A Gradio app (`demo/app.py`) with two tabs: **Mocap · Retarget** (video → pose skeleton + Blender mesh render, `.npy` downloadable) and **💃 Dance Anything** (drop a dance video with music → SAM2 picks the dancer → a target animal performs the dance, re-muxed with the original audio).
+- 🎮 **Interactive web demo** — [try it live on HuggingFace Spaces](https://huggingface.co/spaces/kehong/MoCapAnythingV2) (free, no setup) or run `demo/app.py` locally (same code). Two tabs: **Mocap · Retarget** (video → interactive 3D pose skeleton + textured mesh, plus a synced *input | skeleton | mesh* clip and `.npy` / BVH / glb downloads) and **💃 Dance Anything** (drop a dance video with music → SAM2 picks the dancer → a target creature performs the dance, re-muxed with the original audio). The online build renders in pure Python (no Blender/GL); locally, Blender adds an optional photorealistic render.
 
 ## Pipeline
 
