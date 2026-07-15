@@ -19,6 +19,22 @@ import time
 import shutil
 import zipfile
 
+# Silence the harmless asyncio event-loop GC noise on ZeroGPU / gradio SSR
+# ("Exception ignored in BaseEventLoop.__del__ … ValueError: Invalid file descriptor: -1").
+# It fires during garbage collection of an already-closed loop, after requests finish —
+# it does NOT affect functionality; it just spams the logs and looks alarming.
+_orig_unraisablehook = sys.unraisablehook
+
+
+def _quiet_unraisablehook(unraisable):
+    exc = unraisable.exc_value
+    if isinstance(exc, ValueError) and "Invalid file descriptor" in str(exc):
+        return
+    _orig_unraisablehook(unraisable)
+
+
+sys.unraisablehook = _quiet_unraisablehook
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "demo"))
