@@ -197,6 +197,43 @@ def _mk_gltf_builder():
     return add, finalize
 
 
+def _obj_face_materials(obj_path):
+    """OBJ 多材质:按 usemtl 给每个三角面标材质组,并从 .mtl 解析各组的 map_Kd 贴图。
+    面顺序与 read_obj_mesh 一致(都按文件顺序,且仅三角面)。
+    返回 (face_mtl (F,) int — usemtl 前的面为 -1, [贴图路径或 None]);无 usemtl → (None, None)。"""
+    base = os.path.dirname(obj_path)
+    names, face_mtl, mtl_file, cur = [], [], None, -1
+    try:
+        with open(obj_path) as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("mtllib "):
+                    mtl_file = s.split(None, 1)[1]
+                elif s.startswith("usemtl "):
+                    nm = s.split(None, 1)[1]
+                    if nm not in names:
+                        names.append(nm)
+                    cur = names.index(nm)
+                elif s.startswith("f "):
+                    face_mtl.append(cur)
+    except OSError:
+        return None, None
+    if not names:
+        return None, None
+    texs = {nm: None for nm in names}
+    if mtl_file and os.path.exists(os.path.join(base, mtl_file)):
+        cur_nm = None
+        for line in open(os.path.join(base, mtl_file)):
+            s = line.strip()
+            if s.startswith("newmtl "):
+                cur_nm = s.split(None, 1)[1]
+            elif s.lower().startswith("map_kd ") and cur_nm in texs:
+                tp = os.path.join(base, s.split(None, 1)[1].strip())
+                if os.path.exists(tp):
+                    texs[cur_nm] = tp
+    return np.asarray(face_mtl, np.int64), [texs[nm] for nm in names]
+
+
 def export_skinned_glb(bvh_pth, char_dir, out_mesh, out_skel, fps=None, validate=True):
     """
     预测 BVH + 角色(base_mesh.obj + skinning_weights.npy)→ 两个标准 skinned/rigid glTF:
@@ -231,8 +268,18 @@ def export_skinned_glb(bvh_pth, char_dir, out_mesh, out_skel, fps=None, validate
 
     # 贴图:OBJ 的 uv 是分离索引(顶点/uv 各一套)→ 按面角点 unweld,得到每顶点唯一 uv,
     # 同时把 position/joints/weights 也按角点展开(蒙皮不变,只是复制顶点)。
+    # 贴图来源两种:zoo=单张 texmap0.png;obj=.mtl 多材质(usemtl 分组,各自 map_Kd)。
+    obj_path = os.path.join(char_dir, "base_mesh.obj")
     tex_path = os.path.join(char_dir, "texmap0.png")
-    has_tex = (uvs is not None and face_uvs is not None and os.path.exists(tex_path))
+    face_mtl = mtl_texs = None
+    if os.path.exists(tex_path):
+        face_mtl = np.zeros(len(faces), np.int64)
+        mtl_texs = [tex_path]
+    else:
+        fm, tl = _obj_face_materials(obj_path)
+        if tl is not None and any(tl):
+            face_mtl, mtl_texs = fm, tl
+    has_tex = (uvs is not None and face_uvs is not None and mtl_texs is not None)
     if has_tex:
         uvs = np.asarray(uvs, np.float32); face_uvs = np.asarray(face_uvs, np.int64)
         corner_v = faces.reshape(-1)                      # (Nf*3,) 原顶点索引
@@ -299,7 +346,15 @@ def export_skinned_glb(bvh_pth, char_dir, out_mesh, out_skel, fps=None, validate
 
     # ---------- 写 mesh glb ----------
     add, finalize = _mk_gltf_builder()
-    ii  = add(faces.reshape(-1).astype(np.uint32), pygltflib.UNSIGNED_INT, "SCALAR", target=pygltflib.ELEMENT_ARRAY_BUFFER)
+    # 面按材质组拆 primitive(单贴图=1组;obj 多材质=每 usemtl 一组,各配各的贴图)
+    if has_tex and face_mtl is not None:
+        groups = [(g, face_mtl == g) for g in range(len(mtl_texs)) if (face_mtl == g).any()]
+        if (face_mtl < 0).any():
+            groups.append((-1, face_mtl < 0))          # usemtl 之前的面:无贴图组
+    else:
+        groups = [(-1, np.ones(len(faces), bool))]
+    ii_list = [add(faces[m].reshape(-1).astype(np.uint32), pygltflib.UNSIGNED_INT, "SCALAR",
+                   target=pygltflib.ELEMENT_ARRAY_BUFFER) for _, m in groups]
     ip  = add(verts, pygltflib.FLOAT, "VEC3", target=pygltflib.ARRAY_BUFFER, minmax=True)
     ij  = add(joints4, pygltflib.UNSIGNED_SHORT, "VEC4", target=pygltflib.ARRAY_BUFFER)
     iw  = add(w4.astype(np.float32), pygltflib.FLOAT, "VEC4", target=pygltflib.ARRAY_BUFFER)
@@ -320,7 +375,6 @@ def export_skinned_glb(bvh_pth, char_dir, out_mesh, out_skel, fps=None, validate
     if has_tex:
         _attr.TEXCOORD_0 = add(uv_arr.astype(np.float32), pygltflib.FLOAT, "VEC2", target=pygltflib.ARRAY_BUFFER)
     mesh_node_idx = J
-    prim = Primitive(attributes=_attr, indices=ii, material=0)
     nodes.append(Node(name="charmesh", mesh=0, skin=0))
 
     samplers, channels = [], []
@@ -331,26 +385,46 @@ def export_skinned_glb(bvh_pth, char_dir, out_mesh, out_skel, fps=None, validate
         channels.append(AnimationChannel(sampler=len(samplers) - 1, target={"node": j, "path": "rotation"}))
 
     bin_blob, bvs, accs = finalize()
-    images = images_list = textures = samplers_tex = None
+    images_list = textures = samplers_tex = None
+    _plain = {"pbrMetallicRoughness": {"baseColorFactor": [0.72, 0.78, 0.9, 1.0],
+                                       "roughnessFactor": 0.6, "metallicFactor": 0.0}, "doubleSided": True}
+    materials, prims = [], []
     if has_tex:
-        with open(tex_path, "rb") as _tf:
-            png = _tf.read()
-        pad = (-len(bin_blob)) % 4
-        img_off = len(bin_blob) + pad
-        bin_blob = bin_blob + b"\x00" * pad + png + b"\x00" * ((-len(png)) % 4)
-        bvs.append(BufferView(buffer=0, byteOffset=img_off, byteLength=len(png)))
-        img_bv = len(bvs) - 1
-        images_list = [pygltflib.Image(bufferView=img_bv, mimeType="image/png")]
         samplers_tex = [pygltflib.Sampler(magFilter=9729, minFilter=9987, wrapS=10497, wrapT=10497)]
-        textures = [pygltflib.Texture(source=0, sampler=0)]
-        material = {"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}, "roughnessFactor": 0.7, "metallicFactor": 0.0}, "doubleSided": True}
+        images_list, textures = [], []
+        _tex_idx = {}
+        def _embed(tp):
+            """把贴图字节追加进 bin 末尾(同一路径只嵌一次),返回 texture 索引。"""
+            nonlocal bin_blob
+            if tp in _tex_idx:
+                return _tex_idx[tp]
+            with open(tp, "rb") as _tf:
+                data = _tf.read()
+            pad = (-len(bin_blob)) % 4
+            bvs.append(BufferView(buffer=0, byteOffset=len(bin_blob) + pad, byteLength=len(data)))
+            bin_blob = bin_blob + b"\x00" * pad + data + b"\x00" * ((-len(data)) % 4)
+            mime = "image/jpeg" if tp.lower().endswith((".jpg", ".jpeg")) else "image/png"
+            images_list.append(pygltflib.Image(bufferView=len(bvs) - 1, mimeType=mime))
+            textures.append(pygltflib.Texture(source=len(images_list) - 1, sampler=0))
+            _tex_idx[tp] = len(textures) - 1
+            return _tex_idx[tp]
+        for k, (g, _m) in enumerate(groups):
+            tp = mtl_texs[g] if (g >= 0 and g < len(mtl_texs)) else None
+            if tp:
+                materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": _embed(tp)},
+                                                           "roughnessFactor": 0.7, "metallicFactor": 0.0},
+                                  "doubleSided": True})
+            else:
+                materials.append(dict(_plain))
+            prims.append(Primitive(attributes=_attr, indices=ii_list[k], material=k))
     else:
-        material = {"pbrMetallicRoughness": {"baseColorFactor": [0.72, 0.78, 0.9, 1.0], "roughnessFactor": 0.6, "metallicFactor": 0.0}, "doubleSided": True}
+        materials = [_plain]
+        prims = [Primitive(attributes=_attr, indices=ii_list[0], material=0)]
     gltf = GLTF2(
         scene=0, scenes=[Scene(nodes=[0, mesh_node_idx])], nodes=nodes,
-        meshes=[Mesh(primitives=[prim])],
+        meshes=[Mesh(primitives=prims)],
         skins=[{"joints": list(range(J)), "inverseBindMatrices": ib, "skeleton": 0}],
-        materials=[material],
+        materials=materials,
         images=images_list, textures=textures, samplers=samplers_tex,
         animations=[Animation(samplers=samplers, channels=channels)],
         buffers=[Buffer(byteLength=len(bin_blob))], bufferViews=bvs, accessors=accs)
@@ -391,7 +465,8 @@ def export_skinned_glb(bvh_pth, char_dir, out_mesh, out_skel, fps=None, validate
         channels2.append(AnimationChannel(sampler=len(samplers2) - 1, target={"node": j, "path": "rotation"}))
     bin2, bvs2, accs2 = finalize2()
     g2 = GLTF2(scene=0, scenes=[Scene(nodes=[0])], nodes=nodes2, meshes=meshes2,
-               materials=[{"pbrMetallicRoughness": {"baseColorFactor": [0.32, 0.85, 1.0, 1.0], "roughnessFactor": 0.4, "metallicFactor": 0.0}, "doubleSided": True}],
+               # 深蓝(白底交互面板上有足够对比;之前的青色在白底太浅)
+               materials=[{"pbrMetallicRoughness": {"baseColorFactor": [0.10, 0.34, 0.85, 1.0], "roughnessFactor": 0.5, "metallicFactor": 0.0}, "doubleSided": True}],
                animations=[Animation(samplers=samplers2, channels=channels2)],
                buffers=[Buffer(byteLength=len(bin2))], bufferViews=bvs2, accessors=accs2)
     g2.set_binary_blob(bin2)

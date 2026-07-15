@@ -1,799 +1,721 @@
 #!/usr/bin/env python3
-"""
-MocapAnything V2 — 交互式 Web Demo (Gradio)。HY-Motion 风格 3D + 科幻终端。
+"""MocapAnything V2 — unified demo app (local GPU & HF ZeroGPU, one file).
 
-布局:
-  第 1 排: [ 输入视频 ]  [ 3D pose 骨架(可旋转) ]  [ 3D mesh 结果(可旋转) ]
-  第 2 排: [ 样例视频(hover 预览/点击载入) ]  [ 目标物种画廊(点选) ]  [ 运行终端(流式) ]
-顶部 zoo / obj 数据集切换。运行时终端实时打印阶段(DINO → v2p → p2r → 导出 3D)。
+Runs identically in two environments:
+  · local   : `python demo/app.py` — uses local datasets/ + checkpoints/, direct CUDA,
+              Blender render preferred when available (BLENDER_BIN / blender on PATH).
+  · HF Space: the Space's thin app.py clones this repo and imports this module —
+              `spaces.GPU` windows, weights/data auto-download from the Hub,
+              character meshes lazy-fetched per species.
 
-启动: PYTHONPATH=$PWD:$PWD/TripoSG python demo/app.py  →  http://localhost:7860
+Tabs: 🎯 Mocap · Retarget  |  💃 Dance Anything (dance video + music → character dances).
+Outputs: interactive 3D skeleton + mesh (glb), synced input|skeleton|mesh share clip
+(camera view), npy/BVH/glb download.
 """
-import os, sys, glob, time, threading, html, urllib.parse
+import os
+import sys
+import glob
+import time
+import shutil
+import zipfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "demo"))
 os.chdir(REPO)
 
 import torch
 import gradio as gr
+
+try:
+    import spaces  # ZeroGPU
+    ZERO = True
+except ImportError:
+    ZERO = False
+    class _NS:
+        @staticmethod
+        def GPU(*a, **k):
+            if len(a) == 1 and callable(a[0]):
+                return a[0]
+            return lambda f: f
+    spaces = _NS()
+
 from utils.config_utils import load_yaml_config, instantiate_from_config
 from inference.video2pose2rot import DinoPipe, video_to_frames, inference
+from utils.glb_export import export_skinned_glb
 from preprocess.briarmbg import BriaRMBG
-sys.path.insert(0, os.path.join(REPO, "demo"))
-import dance_utils as du      # noqa: E402  ffmpeg 音视频工具
-import sam_utils as su        # noqa: E402  SAM2 抠人
-from utils.glb_export import export_skinned_glb          # noqa: E402  交互 3D(与 HF Space 同款)
+import sam_utils as su      # SAM2 subject isolation (transformers)
+import dance_utils as du    # ffmpeg audio/video helpers (imageio-ffmpeg)
 try:
-    from utils.composite_render import render_composite  # noqa: E402  输入|骨架|网格 合成片
+    from utils.composite_render import render_composite   # input|skeleton|mesh clip
 except Exception as _ce:
     print(f"[app] composite render unavailable: {_ce}")
     render_composite = None
 
-BASE_CONFIG = os.path.join(REPO, "demo/configs/demo_zoo.yaml")
-DEVICE = os.environ.get("APP_DEVICE", "cuda:0")
-APP_OUT = os.path.join(REPO, "demo_outputs/_app"); os.makedirs(APP_OUT, exist_ok=True)
+BASE_CONFIG = "demo/configs/demo_zoo.yaml"
+OUT = os.path.join(REPO, "demo_outputs/_space" if ZERO else "demo_outputs/_app")
+os.makedirs(OUT, exist_ok=True)
+DATA_REPO = "kehong/MoCapAnythingV2-data-sample"
+WEIGHTS_REPO = "kehong/MoCapAnythingV2-weights"
+
+# Blender is optional; when present the Mocap result additionally gets the
+# photorealistic render (the composite clip is produced either way).
+_BL_WRAP = os.path.join(REPO, "blender_mocapanything.sh")
+BLENDER = (not ZERO and os.path.exists(_BL_WRAP)
+           and bool(os.environ.get("BLENDER_BIN") or shutil.which("blender")))
+print(f"[app] mode={'zerogpu' if ZERO else 'local'} blender={BLENDER}")
 
 
 def _dset_dir(name):
+    """prefer the full local dataset; fall back to demo/data (HF download target)."""
     full = os.path.join(REPO, "datasets", name)
-    demo = os.path.join(REPO, "demo/data", name)
-    return full if os.path.isdir(os.path.join(full, "bvh_pose")) else demo
+    return full if os.path.isdir(os.path.join(full, "bvh_pose")) else os.path.join(REPO, "demo/data", name)
 
-# ref 数据集(目标物种/物体):zoo(动物骨架)/ obj(物体骨架)
-DSET = {
-    # zoo 非人形 mesh 必须用 face-Z+ canonical rest(characters_fix_facezplus),
-    # 否则蒙皮时 mesh 朝向与 _ffs 骨架 rest 不匹配 → 渲染爆炸(蜘蛛腿)。obj 无此处理,用 characters。
-    "zoo": {"base": _dset_dir("zoo1030"), "char_sub": "characters_fix_facezplus"},
-    # zoo 侧面:同一 zoo 数据/角色,ref 强制 y90(侧视参考帧),与正面共享缩略图
-    "zoo_side": {"base": _dset_dir("zoo1030"), "char_sub": "characters_fix_facezplus", "force_view": "y90",
-                 "ref_img_sub": "ref_images_y90"},
-    "obj": {"base": _dset_dir("obj1k"), "char_sub": "characters"},
-}
-# 样例视频来源(3 类,独立于 ref):wild=真实野外动物 / zoo=渲染合成 / obj=物体
-EXSET = {
-    "wild":  os.path.join(REPO, "demo/data/inputs/nbg_wild"),
-    "human": os.path.join(REPO, "demo/data/inputs/nbg_human"),
-    "zoo":   os.path.join(REPO, "demo/data/inputs/nbg_zoo"),
-    "obj":   os.path.join(REPO, "demo/data/inputs/nbg_obj"),
-    "dance": os.path.join(REPO, "demo/data/inputs/dance"),   # Dance Anything 样例(带音频)
-}
 
-# 各来源置顶样例(用户挑选,保持在画廊最前;其余按字母序)
-PINNED = {
-    "wild": ["Chicken#Chicken_Act2", "Dog#Dog_Act2", "Eagle#Eagle_Act2",
-             "Jaguar#Jaguar_Act2", "Leapord#Leapord_Act4"],
-}
+# ---- weights + demo data (download only what's missing → no-op on a local box) ----
+_cfgP = load_yaml_config(BASE_CONFIG)
+_ckpt = os.path.join(_cfgP["weights"]["video2pose_ckpt_root"], _cfgP["experiment"]["exp"],
+                     _cfgP["weights"].get("ckpt_name", "video2pos2rot_ckpt_best.pt"))
+if not os.path.exists(_ckpt):
+    from huggingface_hub import snapshot_download
+    snapshot_download(WEIGHTS_REPO, local_dir="checkpoints")
+if not os.path.isdir(os.path.join(_dset_dir("zoo1030"), "bvh_pose")):
+    from huggingface_hub import snapshot_download
+    snapshot_download(DATA_REPO, repo_type="dataset", local_dir="demo/data",
+                      ignore_patterns=["*/characters/*", "*/characters_fix_facezplus/*"])
 
-# ---- 一次性加载模型 ----
-print(f"[app] device={DEVICE} 加载模型…")
+
+def _ensure_character(base, char_sub, sp):
+    """character mesh dir must hold base_mesh + skinning + *_ffs.bvh; on the Space the
+    startup snapshot skips meshes → lazy-fetch per species (re-fetch if _ffs missing)."""
+    d = os.path.join(base, char_sub, sp)
+    ok = (os.path.exists(os.path.join(d, "base_mesh.obj"))
+          and glob.glob(os.path.join(d, "*_ffs.bvh")))
+    if not ok and base.startswith(os.path.join(REPO, "demo/data")):
+        from huggingface_hub import snapshot_download
+        name = os.path.basename(base)
+        snapshot_download(DATA_REPO, repo_type="dataset", local_dir="demo/data",
+                          allow_patterns=[f"{name}/{char_sub}/{sp}/*"])
+        ok = os.path.exists(os.path.join(d, "base_mesh.obj"))
+    return d if ok else None
+
+
+def _ensure_ref_bvh(base, ref_seq):
+    p = os.path.join(base, "bvh", ref_seq + ".bvh")
+    if not os.path.exists(p) and base.startswith(os.path.join(REPO, "demo/data")):
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(DATA_REPO, repo_type="dataset", local_dir="demo/data",
+                              allow_patterns=[f"{os.path.basename(base)}/bvh/{ref_seq}.bvh"])
+        except Exception:
+            pass
+    return p
+
+
+# ---- models on CPU (ZeroGPU: no CUDA at import; local: moved to cuda on first run) ----
+print("[app] loading models on CPU …")
 _cfg0 = load_yaml_config(BASE_CONFIG)
-_device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
-_rmbg = BriaRMBG.from_pretrained(_cfg0["weights"]["rmbg_weights_dir"]).to(_device).eval()
-_pipe = DinoPipe(_device)
-_model = instantiate_from_config(_cfg0["model"]).float().to(_device).eval()
-_ckpt = os.path.join(_cfg0["weights"]["video2pose_ckpt_root"], _cfg0["experiment"]["exp"],
-                     _cfg0["weights"].get("ckpt_name", "video2pos2rot_ckpt_best.pt"))
-_ck = torch.load(_ckpt, map_location=_device)
-_sd = next((_ck[k] for k in ("model_state", "model", "model_state_dict", "state_dict") if isinstance(_ck, dict) and k in _ck), _ck)
+_rmbg = BriaRMBG.from_pretrained(_cfg0["weights"]["rmbg_weights_dir"]).eval()
+_pipe = DinoPipe(torch.device("cpu"))
+_model = instantiate_from_config(_cfg0["model"]).float().eval()
+_ck = torch.load(_ckpt, map_location="cpu")
+_sd = next((_ck[k] for k in ("model_state", "model", "model_state_dict", "state_dict")
+            if isinstance(_ck, dict) and k in _ck), _ck)
 _model.load_state_dict({(k[7:] if k.startswith("module.") else k): v for k, v in _sd.items()})
-print(f"[app] 模型就绪 {_ckpt}")
+try:
+    print("[app] preloading SAM2 (transformers) on CPU …")
+    print("[app] SAM2 ready" if su.preload() is None else "[app] SAM2 unavailable → RMBG fallback")
+except Exception as _se:
+    print(f"[app] SAM2 preload skipped: {_se}")
+print("[app] models ready")
+
+_moved = {"done": False}
+
+
+def _to_cuda():
+    dev = torch.device((os.environ.get("APP_DEVICE", "cuda:0") if not ZERO else "cuda")
+                       if torch.cuda.is_available() else "cpu")
+    if not _moved["done"]:
+        _model.to(dev); _rmbg.to(dev)
+        _pipe.image_encoder_dinov2.to(dev)
+        _moved["done"] = True
+    return dev
+
+
+# ---- target refs ----
+# obj:只保留老本地 demo 的精选角色(可运行∩有ref图,去掉1个渲染坏的;用户要求不要太多)
+OBJ_KEEP = {
+    "0698819d-b40e-555d-9ef4-139bbc839933", "0a06d19c-d326-53a4-9d72-a9600deaa733",
+    "0a763d17-417d-5473-a41a-7d1a796544d2", "0b8ed01e-5a6d-503f-bc59-24a2eb4e0951",
+    "0df893d8-8774-5cc1-ac74-8111a1c0ae08", "0ff3240c-32e5-5ef3-89ff-e4c30ad80c54",
+    "1a963917-a097-5856-b445-024ebabf7a78", "22160d82-24bc-573c-922e-da11786b5ea2",
+    "2fcedbc3-d899-516b-b339-4f671945e329", "315eddf6-32b7-53e1-8106-c270c726dca8",
+    "530a6b1a-5be2-5d3d-aa68-60ca61cb0974", "5ecda513-bc1b-5d76-849a-beace54e80c5",
+    "6babbd9f-307b-5db5-aabc-35196095cbaa", "82d18eaf-00de-5fd8-91d0-cb2152ae4629",
+    "97e2fc5c-50e4-5199-8632-99fa7160b126", "99d7a77d-61de-5d65-8764-e15a2480cc82",
+    "9a089094-d277-52e2-b00c-4fe2e7c4a717", "9f41c79f-b2d7-5c38-93e2-29cc1470357c",
+    "a6d3cfe3-ac09-5a09-b902-0baf55e5533e",
+}
+
+DSET = {
+    "zoo": {"base": _dset_dir("zoo1030"), "char_sub": "characters_fix_facezplus",
+            "label": "🐾 zoo (animal · front)"},
+    "zoo_side": {"base": _dset_dir("zoo1030"), "char_sub": "characters_fix_facezplus",
+                 "label": "🐾 zoo (animal · side)", "force_view": "y90", "ref_img_sub": "ref_images_y90"},
+    "obj": {"base": _dset_dir("obj1k"), "char_sub": "characters", "label": "📦 obj (objects)"},
+}
 
 
 def _species_map(base, force_view=None):
-    """物种 → ref_seq(Species#Motion/view)。force_view 指定角度(如 'y90' 侧视),
-    否则按 y0(正面)→y90→y30 取第一个可用。同一物种取字母序第一个 motion,
-    正面/侧面用同一 motion,只换视角。"""
-    pose_root = os.path.join(base, "bvh_pose"); train_root = os.path.join(base, "npz_train_image_only")
-    views = [force_view] if force_view else ["y0", "y90", "y30"]
+    pose_root, train_root = f"{base}/bvh_pose", f"{base}/npz_train_image_only"
+    views = [force_view] if force_view else ("y0", "y90", "y30")
     out = {}
     for d in sorted(os.listdir(pose_root)) if os.path.isdir(pose_root) else []:
         sp = d.split("#")[0]
         if sp in out:
             continue
         for v in views:
-            ref = f"{d}/{v}"
-            if os.path.exists(os.path.join(pose_root, ref + ".npz")) and os.path.exists(os.path.join(train_root, ref + ".npz")):
-                out[sp] = ref; break
+            if os.path.exists(f"{pose_root}/{d}/{v}.npz") and os.path.exists(f"{train_root}/{d}/{v}.npz"):
+                out[sp] = f"{d}/{v}"
+                break
     return out
 
 
-THUMB_DIR = os.path.join(REPO, "demo/assets/thumbs")
+_THUMB = os.path.join(REPO, "demo/assets/thumbs")
 
 
-def _build_ex(name):
-    """样例来源:(首帧缩略图, 视频路径) 列表。"""
-    mp4s = sorted(glob.glob(os.path.join(EXSET[name], "*.mp4")))
-    pin = PINNED.get(name, [])
-    rank = {s: i for i, s in enumerate(pin)}
-    mp4s.sort(key=lambda p: (rank.get(os.path.splitext(os.path.basename(p))[0], len(pin)),
-                             os.path.basename(p)))
-    ex_gallery, ex_videos = [], []
-    for mp4 in mp4s:
+def _ref_thumb(base, sp, sub="ref_images"):
+    p = os.path.join(base, sub, f"{sp}.jpg")
+    if os.path.exists(p):
+        return p
+    if sub != "ref_images":
+        p = os.path.join(base, "ref_images", f"{sp}.jpg")
+        if os.path.exists(p):
+            return p
+    cand = sorted(glob.glob(os.path.join(_THUMB, f"{sp}_{sp}_*.jpg")))
+    if cand:
+        return cand[0]
+    tex = sorted(glob.glob(os.path.join(base, "characters", sp, "*.png")))
+    return tex[0] if tex else None
+
+
+for d in DSET.values():
+    d["sp_map"] = _species_map(d["base"], d.get("force_view"))
+    sub = d.get("ref_img_sub", "ref_images")
+    keep = OBJ_KEEP if "obj1k" in d["base"] else None
+    gal, sps = [], []
+    for sp in sorted(d["sp_map"]):
+        if keep is not None and sp not in keep:
+            continue
+        im = _ref_thumb(d["base"], sp, sub)
+        if im:
+            gal.append((im, sp[:14] if len(sp) > 16 else sp))
+            sps.append(sp)
+    d["gallery"] = gal
+    d["species"] = sps
+print("[app] refs: " + " ".join(f"{k}={len(v['gallery'])}" for k, v in DSET.items()))
+
+# ---- sample inputs ----
+EXSET = {
+    "wild":  {"dir": "demo/data/inputs/nbg_wild",  "label": "🦁 wild (real footage)"},
+    "human": {"dir": "demo/data/inputs/nbg_human", "label": "🕺 human (motion)"},
+    "dance": {"dir": "demo/data/inputs/dance",     "label": "💃 dance (with music)"},
+    "zoo":   {"dir": "demo/data/inputs/nbg_zoo",   "label": "🐾 zoo (synthetic)"},
+    "obj":   {"dir": "demo/data/inputs/nbg_obj",   "label": "📦 obj (objects)"},
+}
+EX_FRONT = {
+    "wild": ["Eagle#Eagle_Act2", "Jaguar#Jaguar_Act2", "Chicken#Chicken_Act2",
+             "Leapord#Leapord_Act4", "Dog#Dog_Act2"],
+    "zoo":  ["Hamster#Hamster-RollAttack_y60", "Jaguar#Jaguar-Run_y60",
+             "Eagle#Eagle-Landing_y15", "Dog-2#DOG-SwimIdle_y30", "Horse#HorseALL-FeetUp_y30"],
+    "obj":  ["6babbd9f-307b-5db5-aabc-35196095cbaa#6babbd9f-307b-5db5-aabc-35196095cbaa_y15",
+             "0a763d17-417d-5473-a41a-7d1a796544d2#0a763d17-417d-5473-a41a-7d1a796544d2_y0",
+             "97e2fc5c-50e4-5199-8632-99fa7160b126#97e2fc5c-50e4-5199-8632-99fa7160b126_y30",
+             "1a963917-a097-5856-b445-024ebabf7a78#1a963917-a097-5856-b445-024ebabf7a78_y45",
+             "22160d82-24bc-573c-922e-da11786b5ea2#22160d82-24bc-573c-922e-da11786b5ea2_y45"],
+}
+
+
+def _ex_items(name):
+    vids = sorted(glob.glob(os.path.join(EXSET[name]["dir"], "*.mp4")))
+    front = EX_FRONT.get(name, [])
+    fpos = {s: i for i, s in enumerate(front)}
+    vids.sort(key=lambda p: (fpos.get(os.path.splitext(os.path.basename(p))[0], len(front)), p))
+    items = []
+    for mp4 in vids:
         stem = os.path.splitext(os.path.basename(mp4))[0]
-        th = os.path.join(THUMB_DIR, f"{stem.replace('#', '_')}.jpg")
-        ex_gallery.append((th if os.path.exists(th) else mp4, stem.split("#")[0].split("_")[0]))
-        ex_videos.append(mp4)
-    return {"gallery": ex_gallery, "videos": ex_videos}
+        th = os.path.join(_THUMB, stem.replace("#", "_") + ".jpg")
+        items.append((th if os.path.exists(th) else mp4, stem.split("#")[0][:14]))
+    return vids, items
 
 
-def _runnable(base, sp, char_sub="characters"):
-    """能否完整出结果:需 base_mesh.obj + skinning_weights.npy + *_ffs.bvh(否则 bvh/glb 失败)。
-    char_sub 与渲染用的角色目录一致(zoo=characters_fix_facezplus, obj=characters)。"""
-    cdir = os.path.join(base, char_sub, sp)
-    return (os.path.exists(os.path.join(cdir, "base_mesh.obj")) and
-            os.path.exists(os.path.join(cdir, "skinning_weights.npy")) and
-            bool(glob.glob(os.path.join(cdir, "*_ffs.bvh"))))
+for name in EXSET:
+    EXSET[name]["videos"], EXSET[name]["items"] = _ex_items(name)
+print("[app] samples: " + " ".join(f"{k}={len(v['videos'])}" for k, v in EXSET.items()))
 
 
-# 手动屏蔽的问题 ref(渲染/参考帧有问题)
-BLOCK_REF = {
-    "obj": {"12b981a9-d0ad-5abb-84ce-0ebffe25dd48"},   # obj 原第11个,渲染有问题
-}
+# ---------- SAM subject isolation (uploads) ----------
+def _fg_prior(img_path):
+    """RMBG 前景 bool mask,作为 SAM 候选排序的语义先验(主体排最前)。失败返回 None。
+    预处理与 preprocess/image_process.load_image 的 RMBG 分支一致。"""
+    try:
+        import cv2
+        import numpy as np
+        import torchvision.transforms.functional as TF
+        img = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+        H, W = img.shape[:2]
+        dev = next(_rmbg.parameters()).device
+        t = torch.from_numpy(img).to(dev).float().permute(2, 0, 1) / 255.0
+        t1k = torch.nn.functional.interpolate(t.unsqueeze(0), size=(1024, 1024),
+                                              mode="bilinear", antialias=True)[0]
+        inp = TF.normalize(t1k, [0.5, 0.5, 0.5], [1.0, 1.0, 1.0]).unsqueeze(0)
+        with torch.no_grad():
+            r = _rmbg(inp)[0][0]
+        m = torch.nn.functional.interpolate(r, size=(H, W), mode="bilinear")[0, 0]
+        m = (m - m.min()) / (m.max() - m.min() + 1e-8)
+        return (m > 0.5).cpu().numpy()
+    except Exception as e:
+        print(f"[app] fg prior failed: {e}")
+        return None
 
 
-def _build_ref(name, prio_species, cap=72):
-    """ref 数据集:物种 → ref_seq;画廊(ref 图, 物种名)。只保留可运行物种,示例排最前,总数封顶。"""
-    d = DSET[name]; base = d["base"]
-    sp_map = _species_map(base, d.get("force_view"))
-    img_dir = os.path.join(base, d.get("ref_img_sub", "ref_images"))
-    blocked = BLOCK_REF.get(name, set()) | BLOCK_REF.get(name.replace("_side", ""), set())
-    def ok(sp):
-        return (sp not in blocked and sp in sp_map and os.path.exists(os.path.join(img_dir, f"{sp}.jpg"))
-                and _runnable(base, sp, d.get("char_sub", "characters")))
-    prio = [sp for sp in prio_species if ok(sp)]
-    rest = [sp for sp in sorted(sp_map) if sp not in prio and ok(sp)]
-    ordered = (prio + rest)[:cap]
-    gallery = [(os.path.join(img_dir, f"{sp}.jpg"), sp) for sp in ordered]
-    d.update(sp_map=sp_map, gallery=gallery, gspecies=[s for _, s in gallery])
-    print(f"[app] ref {name}: 可运行物种画廊={len(gallery)}(示例{len(prio)}在前,封顶{cap})")
-
-# 先建样例,再用样例物种给 ref 画廊排优先序
-EX = {name: _build_ex(name) for name in EXSET}
-def _ex_species(*ex_names):
-    out = []
-    for en in ex_names:
-        for mp4 in EX[en]["videos"]:
-            sp = os.path.basename(mp4).split("#")[0].split("_")[0]
-            if sp not in out:
-                out.append(sp)
-    return out
-_build_ref("zoo", _ex_species("wild", "zoo"), cap=72)       # zoo 正面(y0):wild+zoo 示例物种在前
-_build_ref("zoo_side", _ex_species("wild", "zoo"), cap=72)  # zoo 侧面(y90):同序,共享缩略图
-_build_ref("obj", _ex_species("obj"), cap=60)              # obj ref:obj 示例(用户的5个)在前,封顶60
-print(f"[app] 样例: " + " ".join(f"{k}={len(v['videos'])}" for k, v in EX.items()))
-
-# ---- 双语文案 ----
-LANG = {"cur": "en"}   # 当前语言(默认英文;语言开关会改它;各 handler 读它)
-
-TXT = {
-    "zh": {
-        "title": "# 🐾 MocapAnything V2\n**MocapAnything · RetargetingAnything · DanceAnything**",
-        "lang": "🌐 语言 / Language",
-        "in_video": "① 输入视频(上传 / 拖拽 / 选样例)",
-        "ref": "② 参考 ref(点右下画廊选)",
-        "result": "🎬 pose 结果(输入 | 骨架 camera | 骨架 side)",
-        "run": "🚀 运行推理",
-        "download": "⬇ 下载结果(mp4 + npy)",
-        "ex_label": "样例视频来源(点缩略图载入到①)",
-        "ref_label": "目标物种/物体(点图选 · 可与输入不同集 → retarget)",
-        "term_hdr": "**运行终端**",
-        "idle": "idle — 选视频 + 目标物种后点运行",
-        "no_sel": "未选目标物种",
-        "sel": "✅ 目标物种:",
-        "none": "未选",
-        "booting": "启动中…",
-        "frames": "抽取帧数",
-        "done": "完成",
-        "ex_choices": [("🦁 wild(真实野外)", "wild"), ("🕺 human(人体舞蹈)", "human"),
-                       ("🐾 zoo(合成)", "zoo"), ("📦 obj(物体)", "obj")],
-        "ref_choices": [("🐾 zoo(动物 正面)", "zoo"), ("🐾 zoo(动物 侧面)", "zoo_side"),
-                        ("📦 obj(物体)", "obj")],
-        "stage": {"dino": "① 提取 DINO 视频特征", "v2p": "② v2p:视频 → 3D pose",
-                  "p2r": "③ p2r:pose → joint rotation", "plot": "④ 保存 npy + 绘制骨架视频",
-                  "export": "④ 导出交互式 3D", "render": "⑤ blender 渲染 mesh"},
-        # Dance Anything
-        "d_video": "① 舞蹈视频(带音乐)",
-        "d_layers": "② 人物候选层 — 点选「人」那一层",
-        "d_result": "🎬 结果:输入 | 角色(带配乐)",
-        "d_run": "🚀 运行",
-        "d_download": "⬇ 下载",
-        "d_maxsec": "最长秒数 (≤10)",
-        "d_samples": "**样例舞蹈(带音频)**",
-        "d_target": "目标角色",
-        "d_termhdr": "**运行终端**",
-        "d_status0": "上传/点样例 → 自动分割 → 勾人物层 + 选角色 → 运行",
-        "d_idle": "idle — dance anything",
-        "share_note": "💚 觉得有意思就分享一下吧!  #MocapAnythingV2",
-    },
-    "en": {
-        "title": "# 🐾 MocapAnything V2\n**MocapAnything · RetargetingAnything · DanceAnything**",
-        "lang": "🌐 语言 / Language",
-        "in_video": "① Input video (upload / drag / pick a sample)",
-        "ref": "② Reference (pick from gallery ↘)",
-        "result": "🎬 Pose result (input | skeleton camera | skeleton side)",
-        "run": "🚀 Run inference",
-        "download": "⬇ Download (mp4 + npy)",
-        "ex_label": "Sample video source (click thumbnail → loads into ①)",
-        "ref_label": "Target species/object (click to pick · can differ from input → retarget)",
-        "term_hdr": "**Run terminal**",
-        "idle": "idle — pick a video + target species, then run",
-        "no_sel": "No target selected",
-        "sel": "✅ Target: ",
-        "none": "none",
-        "booting": "booting…",
-        "frames": "frames extracted",
-        "done": "done",
-        "ex_choices": [("🦁 wild (real footage)", "wild"), ("🕺 human (dance)", "human"),
-                       ("🐾 zoo (synthetic)", "zoo"), ("📦 obj (objects)", "obj")],
-        "ref_choices": [("🐾 zoo (animal front)", "zoo"), ("🐾 zoo (animal side)", "zoo_side"),
-                        ("📦 obj (objects)", "obj")],
-        "stage": {"dino": "① Extract DINO video features", "v2p": "② v2p: video → 3D pose",
-                  "p2r": "③ p2r: pose → joint rotation", "plot": "④ Save npy + plot skeleton video",
-                  "export": "④ Export interactive 3D", "render": "⑤ Blender mesh render"},
-        # Dance Anything
-        "d_video": "① Dance video (with audio)",
-        "d_layers": "② Person layers — click the person",
-        "d_result": "🎬 Result: input | character (+audio)",
-        "d_run": "🚀 Run dance",
-        "d_download": "⬇ Download",
-        "d_maxsec": "Max sec (≤10)",
-        "d_samples": "**Sample dance videos (with audio)**",
-        "d_target": "Target character",
-        "d_termhdr": "**Run terminal**",
-        "d_status0": "upload/pick a sample → auto-segment → pick person + character → Run",
-        "d_idle": "idle — dance anything",
-        "share_note": "💚 Please share if you find it interesting!  #MocapAnythingV2",
-    },
-}
-
-
-def T():
-    return TXT[LANG["cur"]]
-
-
-def _fp(path):
-    return "/gradio_api/file=" + urllib.parse.quote(os.path.abspath(path))
-
-
-# 终端配色:全部内联 style(gradio 6 会清洗 <style> 块,故不用 class)
-# 绿色系为主,每行循环换色 + 辉光;时间 count 亮蓝,报错亮红
-_TERM_BOX = ("background:#050a05;border:1px solid #2c9a5a;border-radius:8px;padding:12px 16px;"
-             "font-family:'DejaVu Sans Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13.5px;font-weight:500;"
-             "color:#7dffb0;line-height:1.9;overflow:auto;min-height:452px;max-height:452px;"
-             "box-shadow:inset 0 0 14px #1c4a2c55")
-_TERM_HDR = ("color:#4dffa0;font-weight:700;opacity:.85;font-size:12px;letter-spacing:.08em;"
-             "border-bottom:1px solid #1c4a2c;padding-bottom:6px;margin-bottom:8px")
-_S_GRN = "color:#4dffa0;font-weight:600;text-shadow:0 0 3px #00ff8844"      # 提示符 绿
-_S_BLUE = "color:#5fb8ff;font-weight:600;text-shadow:0 0 3px #2b8fff44"     # 时间 count 蓝
-_S_ERR = "color:#ff6b6b;font-weight:600;text-shadow:0 0 3px #ff000033"      # 报错红
-# 每行循环配色(绿→青→黄绿→薄荷,彼此有别但柔和)
-_PALETTE = ["#7dffb0", "#b6f56a", "#5fe8d0", "#d0f56a", "#4fd6a8", "#a6f58a", "#6fd8ff", "#c4f58a"]
-
-
-def term_html(lines, running=False):
-    cur = f'<span style="{_S_GRN}">█</span>' if running else ""
-    rows = []
-    for i, ln in enumerate(lines):
-        c = _PALETTE[i % len(_PALETTE)]
-        rows.append(f'<span style="color:{c};font-weight:500;text-shadow:0 0 3px {c}44">{ln}</span>')
-    body = "<br>".join(rows)
-    return (f'<div style="{_TERM_BOX}">'
-            f'<div style="{_TERM_HDR}">▮ RUN TERMINAL</div>'
-            f'<span style="{_S_GRN}">mocap@v2</span>:~$ {body} {cur}</div>')
-
-
-SPACE_URL = "https://huggingface.co/spaces/kehong/MoCapAnythingV2"
-
-
-def _share_html(species, vid_elem="lresmp4"):
-    """share 按钮(与 HF Space 同款):移动端 navigator.share 附带视频文件,桌面回退链接。"""
-    import urllib.parse as up
-    text = f"I just animated a {species} from a video with MoCapAnything V2! 🐾 #MoCapAnythingV2"
-    u = up.quote(SPACE_URL); t = up.quote(text)
-    x = f"https://twitter.com/intent/tweet?text={t}&url={u}&hashtags=MoCapAnythingV2"
-    btn = ("display:inline-flex;align-items:center;gap:6px;padding:8px 16px;margin:4px 6px 0 0;border:0;"
-           "border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;color:#fff;cursor:pointer;")
-    js = ("async function mcaShare(){"
-          f"const v=document.querySelector('#{vid_elem} video');"
-          "const msg=" + repr(text) + ";const url=" + repr(SPACE_URL) + ";"
-          "try{if(v&&v.src){const r=await fetch(v.src);const b=await r.blob();"
-          "const f=new File([b],'mocapanything.mp4',{type:'video/mp4'});"
-          "if(navigator.canShare&&navigator.canShare({files:[f]})){"
-          "await navigator.share({files:[f],text:msg,url:url});return;}}}catch(e){}"
-          "window.open(" + repr(x) + ",'_blank');}")
-    return (f'<script>{js}</script>'
-            '<div style="padding:6px 2px">'
-            '<span style="font-weight:600;margin-right:8px">✨ Share:</span>'
-            f'<button onclick="mcaShare()" style="{btn}background:linear-gradient(90deg,#833ab4,#fd1d1d,#fcb045)">'
-            '📲 Share result video</button>'
-            f'<a href="{x}" target="_blank" style="{btn}background:#000">𝕏 / Twitter</a>'
-            f'<button onclick="navigator.clipboard.writeText(\'{SPACE_URL}\');this.textContent=\'✓ copied\'" '
-            f'style="{btn}background:#e75480">📋 Copy link</button></div>')
-
-
-def run_inference(video_path, species, dset):
-    d = DSET[dset]; sp_map = d["sp_map"]
+@spaces.GPU(duration=90)
+def segment_upload(video_path):
     if not video_path:
-        raise gr.Error("请先选择或上传一个视频")
-    if not species or species not in sp_map:
-        raise gr.Error("请在下方画廊点选一个目标物种")
-    ref_seq = sp_map[species]
+        return None, gr.update(value=[], visible=False), "Upload a video, then pick the subject to track."
+    if not su.available():
+        return ({"video": video_path, "segs": None}, gr.update(value=[], visible=False),
+                "SAM2 unavailable — RMBG will auto-matte on Run.")
+    _to_cuda()
+    stamp = str(int(time.time() * 1000))[-9:]
+    work = os.path.join(OUT, "seg" + stamp)
+    orig = os.path.join(work, "orig"); sam = os.path.join(work, "sam")
+    os.makedirs(orig, exist_ok=True); os.makedirs(sam, exist_ok=True)
+    video_to_frames(video_path, orig)
+    from PIL import Image
+    for f in sorted(os.listdir(orig)):
+        if f.endswith(".png"):
+            Image.open(os.path.join(orig, f)).convert("RGB").save(os.path.join(sam, f[:-4] + ".jpg"))
+    f0 = sorted(glob.glob(os.path.join(orig, "*.png")))
+    if not f0:
+        return ({"video": video_path, "segs": None}, gr.update(value=[], visible=False),
+                "Could not decode the video.")
+    seed_idx = len(f0) // 2      # 中段帧:避开片头标题卡/黑场
+    prevs, segs = su.candidate_layers(f0[seed_idx], os.path.join(work, "cand"), topk=8,
+                                      prior=_fg_prior(f0[seed_idx]))
+    ctx = {"video": video_path, "work": work, "orig": orig, "sam": sam, "segs": segs,
+           "seed_idx": seed_idx}
+    if prevs:
+        return (ctx, gr.update(value=prevs, visible=True),
+                f"✅ SAM found **{len(prevs)}** subjects — click the one to track, then Run.")
+    return ctx, gr.update(value=[], visible=False), "SAM found no subject — RMBG will auto-matte on Run."
+
+
+def pick_subject(evt: gr.SelectData):
+    return evt.index, f"✅ subject **#{evt.index + 1}** selected — pick a target, then Run."
+
+
+# ---------- gallery plumbing ----------
+GAL_DEFAULT = 30
+
+
+def on_dset(name):
+    d = DSET[name]
+    show = [im for im, _ in d["gallery"][:GAL_DEFAULT]]
+    more = len(d["gallery"]) > GAL_DEFAULT
+    return (gr.update(value=show), None, "No target selected",
+            gr.update(visible=more, value=f"▾ Load all {len(d['gallery'])} targets"))
+
+
+def load_more(name):
+    d = DSET[name]
+    return gr.update(value=[im for im, _ in d["gallery"]]), gr.update(visible=False)
+
+
+def on_species(name, evt: gr.SelectData):
+    d = DSET[name]
+    if evt.index is None or evt.index >= len(d["species"]):
+        return None, "No target selected"
+    sp = d["species"][evt.index]
+    return sp, f"🎯 target: **{sp[:16]}**"
+
+
+def _safe_copy(src):
+    """'#' in a filename breaks gradio's /file= URL (fragment) → copy to a safe name."""
+    safe = os.path.join(OUT, "_ex_" + os.path.basename(src).replace("#", "_"))
+    if not os.path.exists(safe):
+        shutil.copy2(src, safe)
+    return safe
+
+
+def on_exset(name):
+    return gr.update(value=EXSET[name]["items"])
+
+
+def load_example(exname, active, evt: gr.SelectData):
+    """route a sample click to the active tab: mocap input, or the dance flow."""
+    vids = EXSET[exname]["videos"]
+    if evt.index is None or evt.index >= len(vids):
+        return gr.update(), gr.update(), gr.update(), "No sample", gr.update()
+    safe = _safe_copy(vids[evt.index])
+    if active == "dance":
+        return gr.update(), gr.update(), gr.update(), "Dance sample loaded — segmenting…", safe
+    return safe, None, None, "Example loaded — pick a target, then Run.", gr.update()
+
+
+# ---------- Mocap / Retarget ----------
+@spaces.GPU(duration=120)
+def run(video_path, seg_ctx, subject_idx, dset, species, progress=gr.Progress()):
+    if not video_path:
+        raise gr.Error("Pick or upload a video first.")
+    d = DSET[dset]
+    if not species or species not in d["sp_map"]:
+        raise gr.Error("Pick a target species / object from the gallery.")
+    dev = _to_cuda()
+
     stamp = str(int(time.time() * 1000))[-9:]
     seq_name = f"{species}#req{stamp}"
-    work = os.path.join(APP_OUT, stamp)
-    frames_dir = os.path.join(work, "frames", seq_name); os.makedirs(frames_dir, exist_ok=True)
+    work = os.path.join(OUT, stamp)
+    frames_dir = os.path.join(work, "frames", seq_name)
+    os.makedirs(frames_dir, exist_ok=True)
 
-    lines = [f'run --dataset {dset} --species <b>{html.escape(species[:20])}</b>']
-    t0 = time.time()
-    _idle6 = (None, None, None, gr.update(), gr.update())
-    yield (term_html(lines + [T()["booting"]], True),) + _idle6
+    if seg_ctx and subject_idx is not None and seg_ctx.get("segs") and su.available():
+        progress(0.1, desc="SAM tracking subject")
+        try:
+            n = su.track_to_rgba(seg_ctx["sam"], seg_ctx["segs"][subject_idx], seg_ctx["orig"],
+                                 frames_dir, seed_idx=seg_ctx.get("seed_idx", 0))
+            if n == 0:
+                video_to_frames(video_path, frames_dir)
+        except Exception:
+            video_to_frames(video_path, frames_dir)
+    else:
+        progress(0.1, desc="extracting frames")
+        video_to_frames(video_path, frames_dir)
 
-    nfr = video_to_frames(video_path, frames_dir)
-    lines.append(f"{T()['frames']}: {nfr}")
-
+    progress(0.15, desc="fetching character")
     base = d["base"]
+    if _ensure_character(base, d["char_sub"], species) is None:
+        raise gr.Error("Character assets for this target are unavailable — pick another target.")
+    if not os.path.exists(_ensure_ref_bvh(base, d["sp_map"][species])):
+        raise gr.Error("Reference motion for this target isn't available yet — pick another target.")
+
     cfg = load_yaml_config(BASE_CONFIG)
     cfg["data"].update(base_dir=base,
-                       scale_dict_path=os.path.join(base, "cache/__mesh2pose1002_species_scale_cache.pkl"),
-                       character_dir=os.path.join(base, d.get("char_sub", "characters")),
-                       bvh_roots=[os.path.join(base, "bvh")],
+                       scale_dict_path=f"{base}/cache/__mesh2pose1002_species_scale_cache.pkl",
+                       character_dir=os.path.join(base, d["char_sub"]),
+                       bvh_roots=[f"{base}/bvh"],
                        image_roots=[os.path.join(work, "frames")], wild_flag=True)
-    cfg["data"]["retarget"].update(ref_seq=ref_seq, ref_idx=0)
-    # Blender 可选(装了则出 _final.mp4 写实渲染,~4min;没装自动跳过 → 合成片)
+    cfg["data"]["retarget"].update(ref_seq=d["sp_map"][species], ref_idx=0)
     cfg["output"].update(save_dir=os.path.join(work, "out"), output_tag="app",
-                         blender_path=os.path.join(REPO, "blender_mocapanything.sh"))
-    cfg["export_glb"] = True   # 交互 3D(与 HF Space 同款)
+                         blender_path=_BL_WRAP if BLENDER else None)
+    cfg["export_glb"] = True
 
-    # 每阶段记录 (名称, 起始时间);展示时算每阶段耗时(下一阶段起始 - 本阶段起始;最后阶段用当前时间)
-    state = {"log": [], "done": False, "err": None}
-    def _cb(nm): state["log"].append([nm, time.time()])   # 存 key,渲染时按当前语言翻译
-    def _worker():
-        try:
-            inference(cfg=cfg, device=_device, attention_design=cfg["model"]["attention_kwargs"],
-                      model=_model, pipe=_pipe, rmbg_net=_rmbg, seq_name=seq_name,
-                      image_folder=frames_dir, stage_cb=_cb)
-        except Exception as e:
-            import traceback; state["err"] = f"{e}\n{traceback.format_exc()[-300:]}"
-        finally:
-            state["done"] = True
-    th = threading.Thread(target=_worker, daemon=True); th.start()
+    steps = {"dino": 0.25, "v2p": 0.45, "p2r": 0.6, "plot": 0.7, "export": 0.78, "render": 0.82}
+    inference(cfg=cfg, device=dev, attention_design=cfg["model"]["attention_kwargs"],
+              model=_model, pipe=_pipe, rmbg_net=_rmbg, seq_name=seq_name,
+              image_folder=frames_dir,
+              stage_cb=lambda nm: progress(steps.get(nm, 0.6), desc=nm))
 
-    def _stage_lines(running):
-        lg = state["log"]; out = []
-        for i, (nm, ts) in enumerate(lg):
-            end = lg[i + 1][1] if i + 1 < len(lg) else time.time()
-            dur = end - ts
-            spin = ' ⏳' if (running and i == len(lg) - 1 and not state["done"]) else ""
-            label = T()["stage"].get(nm, nm)
-            out.append(f'{label} <span style="{_S_BLUE}">({dur:.1f}s)</span>{spin}')
-        return out
-
-    while not state["done"]:
-        yield (term_html(lines + _stage_lines(True), True),) + _idle6
-        time.sleep(0.2)
-    if state["err"]:
-        lines += _stage_lines(False)
-        lines.append(f'<span style="{_S_ERR}">ERROR: {html.escape(state["err"][:180])}</span>')
-        yield (term_html(lines),) + _idle6; return
-    lines += _stage_lines(False)
-
-    import shutil, zipfile
     out_root = os.path.join(work, "out")
     bvh = next(iter(glob.glob(os.path.join(out_root, "**", "*_rot6d_pred.bvh"), recursive=True)), None)
-    npys = glob.glob(os.path.join(out_root, "**", "*_pred.npy"), recursive=True)
-    char_dir = os.path.join(d["base"], d.get("char_sub", "characters"), species)
+    if not bvh:
+        raise gr.Error("Inference produced no motion — try another video.")
+    char = os.path.join(base, d["char_sub"], species)
 
-    # 交互 3D(inference export_glb 已产出;兜底再导一次)
+    progress(0.85, desc="building interactive 3D")
     mesh_glb = next(iter(glob.glob(os.path.join(out_root, "**", "*_mesh.glb"), recursive=True)), None)
     skel_glb = next(iter(glob.glob(os.path.join(out_root, "**", "*_skeleton.glb"), recursive=True)), None)
-    if bvh and not (mesh_glb and skel_glb):
-        try:
-            mesh_glb = os.path.join(work, f"{species[:16]}_mesh.glb")
-            skel_glb = os.path.join(work, f"{species[:16]}_skeleton.glb")
-            export_skinned_glb(bvh, char_dir, mesh_glb, skel_glb, fps=15, validate=False)
-        except Exception as _ge:
-            print(f"[app] glb export failed: {_ge}"); mesh_glb = skel_glb = None
+    if not (mesh_glb and skel_glb):
+        mesh_glb = os.path.join(work, f"{species[:16]}_mesh.glb")
+        skel_glb = os.path.join(work, f"{species[:16]}_skeleton.glb")
+        export_skinned_glb(bvh, char, mesh_glb, skel_glb, fps=15, validate=False)
 
-    # 结果视频:Blender _final.mp4(若装了 Blender)> 合成片(输入|骨架|网格,numpy)
+    # share clip: Blender _final.mp4 when available, else the synced composite
+    progress(0.9, desc="rendering shareable clip")
+    clip = None
     finals = glob.glob(os.path.join(out_root, "**", "*_final.mp4"), recursive=True)
-    result_mp4 = None
     if finals:
-        result_mp4 = os.path.join(work, os.path.basename(finals[0]).replace("#", "_"))
-        shutil.copy2(finals[0], result_mp4)
-    elif render_composite is not None and bvh:
-        img_panel = next(iter(glob.glob(os.path.join(out_root, "**", "*_pose_compare_image.mp4"), recursive=True)), None)
+        clip = os.path.join(work, os.path.basename(finals[0]).replace("#", "_"))
+        shutil.copy2(finals[0], clip)
+    elif render_composite is not None:
+        img_panel = next(iter(glob.glob(os.path.join(out_root, "**", "*_pose_compare_image.mp4"),
+                                        recursive=True)), None)
         if img_panel:
-            rc = render_composite(bvh, char_dir, img_panel, os.path.join(work, "composite.mp4"), fps=15)
-            result_mp4 = rc[0] if rc else None
-    if result_mp4 is None:
+            rc = render_composite(bvh, char, img_panel, os.path.join(work, f"composite_{species[:16]}.mp4"), fps=15)
+            clip = rc[0] if rc else None
+    if clip is None:
         pc = next(iter(glob.glob(os.path.join(out_root, "**", "*_pose_compare.mp4"), recursive=True)), None)
         if pc:
-            result_mp4 = os.path.join(work, "pose_compare.mp4"); shutil.copy2(pc, result_mp4)
-    if result_mp4 is None:
-        lines.append(f'<span style="{_S_ERR}">no result video</span>')
-        yield (term_html(lines),) + _idle6; return
+            clip = os.path.join(work, "pose_compare.mp4"); shutil.copy2(pc, clip)
 
-    zpath = os.path.join(work, f"{species[:16]}_result.zip")
-    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(result_mp4, os.path.basename(result_mp4))
-        for f in npys:
-            if f.endswith("_pred.npy"):
-                zf.write(f, os.path.basename(f))
-        if bvh:
-            zf.write(bvh, os.path.basename(bvh))
+    zpath = os.path.join(work, f"mocapanything_{species[:16]}.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in glob.glob(os.path.join(out_root, "**", "*_pred.npy"), recursive=True):
+            z.write(f, os.path.basename(f))
+        z.write(bvh, os.path.basename(bvh))
         for g in (mesh_glb, skel_glb):
             if g and os.path.exists(g):
-                zf.write(g, os.path.basename(g))
-    lines.append(f'<span style="{_S_GRN}">✔ {T()["done"]} {time.time()-t0:0.1f}s · {nfr} frames · mp4 + npy + bvh + glb</span>')
-    yield (term_html(lines), result_mp4, skel_glb, mesh_glb,
-           gr.update(value=zpath, visible=True), gr.update(value=_share_html(species), visible=True))
+                z.write(g, os.path.basename(g))
+        if clip:
+            z.write(clip, os.path.basename(clip))
+    progress(1.0, desc="done")
+    return (skel_glb, mesh_glb, gr.update(value=zpath, visible=True),
+            gr.update(value=clip, visible=bool(clip)),
+            gr.update(value=_share_html(species), visible=True))
 
 
-def on_species_select(dset, evt: gr.SelectData):
-    d = DSET[dset]
-    i = evt.index
-    if i is None or i >= len(d["gspecies"]):
-        return None, T()["none"], None
-    sp = d["gspecies"][i]
-    ref_img = d["gallery"][i][0]
-    return sp, f'{T()["sel"]}{sp[:24]}', ref_img
-
-
-def on_example_select(name, evt: gr.SelectData):
-    vids = EX[name]["videos"]
-    if evt.index is None or evt.index >= len(vids):
-        return None
-    src = vids[evt.index]
-    # 拷成无 # 的安全名(gr.Video 服务 URL 遇 # 会截断 → 显示失败)
-    import shutil
-    safe = os.path.join(APP_OUT, "_ex_" + os.path.basename(src).replace("#", "_"))
-    try:
-        if not os.path.exists(safe):
-            shutil.copy2(src, safe)
-        return safe
-    except Exception:
-        return src
-
-
-def on_ref_change(name):
-    d = DSET[name]
-    return gr.update(value=[i for i, _ in d["gallery"]]), None, T()["no_sel"], None
-
-def on_ex_change(name):
-    return gr.update(value=[t for t, _ in EX[name]["gallery"]])
-
-
-def on_lang_change(lang):
-    LANG["cur"] = lang if lang in TXT else "zh"
-    t = T()
-    return (
-        gr.update(value=t["title"]),                              # title_md
-        gr.update(label=t["in_video"]),                           # video_in
-        gr.update(label=t["ref"]),                                # ref_img
-        gr.update(label=t["result"]),                             # result_out
-        gr.update(value=t["run"]),                                # run_btn
-        gr.update(value=t["no_sel"]),                             # sel_label(切换语言重置选择提示)
-        gr.update(label=t["download"]),                           # dl_btn
-        gr.update(label=t["ex_label"], choices=t["ex_choices"]),  # ex_ds
-        gr.update(label=t["ref_label"], choices=t["ref_choices"]),# ref_ds
-        term_html([t["idle"]]),                                   # term
-        gr.update(value=t["share_note"]),                         # tabnote_md
-        # ---- Dance tab ----
-        gr.update(label=t["d_video"]),                            # dance_video
-        gr.update(label=t["d_layers"]),                           # dcand_gallery
-        gr.update(label=t["d_result"]),                           # dance_out
-        gr.update(label=t["d_maxsec"]),                           # dmax
-        gr.update(value=t["d_run"]),                              # drun_btn
-        gr.update(value=t["d_status0"]),                          # dstatus
-        gr.update(label=t["d_download"]),                         # ddl_btn
-        gr.update(value=t["d_samples"]),                          # dsamp_md
-        gr.update(label=t["d_target"], choices=t["ref_choices"]), # dref_ds
-        term_html([t["d_idle"]]),                                 # dterm
-    )
-
-
-# ================= Dance Anything =================
+# ---------- 💃 Dance Anything ----------
 DANCE_FPS = 30
 
 
-def _cfg_and_infer(work, frames_dir, seq_name, d, ref_seq, lines, t0, tag="dance"):
-    """公用:建 cfg(fps=30)+ 起推理线程 + 阶段流。yield (term_html, None, update) 直到完成;
-    返回时 lines 已含各阶段。出错则最后一次 yield 后调用方应 return。"""
-    base = d["base"]
-    cfg = load_yaml_config(BASE_CONFIG)
-    cfg["data"].update(base_dir=base,
-                       scale_dict_path=os.path.join(base, "cache/__mesh2pose1002_species_scale_cache.pkl"),
-                       character_dir=os.path.join(base, d.get("char_sub", "characters")),
-                       bvh_roots=[os.path.join(base, "bvh")],
-                       image_roots=[os.path.join(work, "frames")], wild_flag=True)
-    cfg["data"]["retarget"].update(ref_seq=ref_seq, ref_idx=0)
-    cfg["output"].update(save_dir=os.path.join(work, "out"), output_tag=tag,
-                         blender_path=os.path.join(REPO, "blender_mocapanything.sh"), fps=DANCE_FPS)
-    cfg["export_glb"] = False
-    state = {"log": [], "done": False, "err": None}
-    def _cb(nm): state["log"].append([nm, time.time()])
-    def _worker():
-        try:
-            inference(cfg=cfg, device=_device, attention_design=cfg["model"]["attention_kwargs"],
-                      model=_model, pipe=_pipe, rmbg_net=_rmbg, seq_name=seq_name,
-                      image_folder=frames_dir, stage_cb=_cb)
-        except Exception as e:
-            import traceback; state["err"] = f"{e}\n{traceback.format_exc()[-300:]}"
-        finally:
-            state["done"] = True
-    threading.Thread(target=_worker, daemon=True).start()
-    def _stage_lines(running):
-        lg = state["log"]; out = []
-        for i, (nm, ts) in enumerate(lg):
-            end = lg[i + 1][1] if i + 1 < len(lg) else time.time()
-            spin = ' ⏳' if (running and i == len(lg) - 1 and not state["done"]) else ""
-            out.append(f'{T()["stage"].get(nm, nm)} <span style="{_S_BLUE}">({end-ts:.1f}s)</span>{spin}')
-        return out
-    while not state["done"]:
-        yield term_html(lines + _stage_lines(True), True), None, gr.update()
-        time.sleep(0.2)
-    lines += _stage_lines(False)
-    if state["err"]:
-        lines.append(f'<span style="{_S_ERR}">ERROR: {html.escape(state["err"][:180])}</span>')
-        state["failed"] = True
-    yield ("__DONE__", state.get("failed", False), None)
-
-
-def dance_segment(video_path, max_sec):
-    """上传舞蹈视频 → 标准化 30fps + 抽帧 + 抽音轨 + SAM 候选图层。"""
+def _dance_segment_impl(video_path, max_sec):
     if not video_path:
-        raise gr.Error("请先上传舞蹈视频 / upload a dance video first")
+        return None, [], "upload / pick a dance sample first"
+    _to_cuda()
     stamp = str(int(time.time() * 1000))[-9:]
-    work = os.path.join(APP_OUT, "dance" + stamp); os.makedirs(work, exist_ok=True)
-    std = du.standardize_30fps(video_path, os.path.join(work, "std.mp4"), max_seconds=float(max_sec), fps=DANCE_FPS)
-    orig_dir = os.path.join(work, "orig"); du.frames_from_video(std, orig_dir, ext="png")
-    sam_dir = os.path.join(work, "sam"); du.frames_from_video(std, sam_dir, ext="jpg")
+    work = os.path.join(OUT, "dance" + stamp)
+    os.makedirs(work, exist_ok=True)
+    std = du.standardize_30fps(video_path, os.path.join(work, "std.mp4"),
+                               max_seconds=float(max_sec), fps=DANCE_FPS)
+    orig = os.path.join(work, "orig"); du.frames_from_video(std, orig, ext="png")
+    sam = os.path.join(work, "sam"); du.frames_from_video(std, sam, ext="jpg")
     audio = du.extract_audio(video_path, os.path.join(work, "audio.m4a"))
-    prevs, segs = su.candidate_layers(os.path.join(orig_dir, "00000.png"), os.path.join(work, "cand"), topk=8)
-    ctx = {"work": work, "std": std, "orig_dir": orig_dir, "sam_dir": sam_dir, "audio": audio, "segs": segs}
+    ofrs = sorted(glob.glob(os.path.join(orig, "*.png")))
+    seed_idx = len(ofrs) // 2    # 中段帧:避开片头标题卡
+    prevs, segs = su.candidate_layers(ofrs[seed_idx], os.path.join(work, "cand"), topk=8,
+                                      prior=_fg_prior(ofrs[seed_idx]))
+    ctx = {"work": work, "std": std, "orig": orig, "sam": sam, "audio": audio, "segs": segs,
+           "seed_idx": seed_idx}
     if prevs:
-        status = f"✅ SAM found **{len(prevs)}** layers — click the person layer / 点选「人」那一层"
-    else:
-        status = "⚠ SAM found no layer — will fall back to RMBG auto-matting / 回退 RMBG 自动抠人"
-    return ctx, prevs, status, None
+        return ctx, prevs, f"✅ SAM found **{len(prevs)}** layers — click the person, pick a character, Run."
+    return ctx, [], "SAM found no layer — RMBG will auto-matte. Pick a character, then Run."
+
+
+@spaces.GPU(duration=90)
+def dance_segment(video_path, max_sec):
+    return _dance_segment_impl(video_path, max_sec)
 
 
 def dance_pick(evt: gr.SelectData):
-    return evt.index, f"✅ picked person layer **#{evt.index + 1}** / 选中第 {evt.index + 1} 层 — pick a character then Run"
+    return evt.index, f"✅ person layer **#{evt.index + 1}** — pick a character, then Run."
 
 
-def dance_example_load(max_sec, evt: gr.SelectData):
-    """点样例 dance 视频(带音频):载入 ① 并自动 SAM 分割 → 候选人物图层。"""
-    vids = EX["dance"]["videos"]
-    if evt.index is None or evt.index >= len(vids):
-        return gr.update(), None, [], "…", None
-    import shutil
-    src = vids[evt.index]
-    safe = os.path.join(APP_OUT, "_dex_" + os.path.basename(src))
-    if not os.path.exists(safe):
-        shutil.copy2(src, safe)
-    ctx, prevs, status, pick = dance_segment(safe, max_sec)
-    return safe, ctx, prevs, status, pick
+@spaces.GPU(duration=180)
+def run_dance(ctx, pick_idx, dset, species, progress=gr.Progress()):
+    if not ctx or not ctx.get("orig"):
+        raise gr.Error("Upload / pick a dance video first (it auto-segments).")
+    d = DSET[dset]
+    if not species or species not in d["sp_map"]:
+        raise gr.Error("Pick a target character from the gallery below.")
+    dev = _to_cuda()
+    work = ctx["work"]
+    seq_name = f"{species}#d{os.path.basename(work)}"
+    frames_dir = os.path.join(work, "frames", seq_name)
+    os.makedirs(frames_dir, exist_ok=True)
 
-
-def d_ref_change(name):
-    d = DSET[name]
-    return gr.update(value=[i for i, _ in d["gallery"]]), None, "Pick a target character / 选一个目标角色"
-
-
-def d_species_select(dset, evt: gr.SelectData):
-    d = DSET[dset]; i = evt.index
-    if i is None or i >= len(d["gspecies"]):
-        return None, "none"
-    sp = d["gspecies"][i]
-    return sp, f"✅ character: **{sp[:24]}** — click Run / 已选角色,点 Run"
-
-
-def run_dance(ctx, pick_idx, species, dset):
-    if not ctx or not ctx.get("orig_dir"):
-        raise gr.Error("请先上传并点 Segment / upload & click Segment first")
-    d = DSET[dset]; sp_map = d["sp_map"]
-    if not species or species not in sp_map:
-        raise gr.Error("请点选目标角色 / pick a target character")
-    ref_seq = sp_map[species]
-    work = ctx["work"]; seq_name = f"{species}#d{os.path.basename(work)}"
-    frames_dir = os.path.join(work, "frames", seq_name); os.makedirs(frames_dir, exist_ok=True)
-    lines = [f'dance --char <b>{html.escape(species[:20])}</b> --fps 30 --max {len(os.listdir(ctx["orig_dir"]))}f']
-    t0 = time.time()
-    yield term_html(lines + ["SAM matting…"], True), None, gr.update()
-
-    # 1) 抠人 → RGBA 帧(SAM 选中层跟踪;失败/未选 → 回退原图,推理内部 RMBG)
+    progress(0.05, desc="SAM matting")
     used = "RMBG"
     if pick_idx is not None and ctx.get("segs") and 0 <= pick_idx < len(ctx["segs"]):
-        n = su.track_to_rgba(ctx["sam_dir"], ctx["segs"][pick_idx], ctx["orig_dir"], frames_dir)
-        if n > 0:
-            used = "SAM"
+        try:
+            if su.track_to_rgba(ctx["sam"], ctx["segs"][pick_idx], ctx["orig"], frames_dir,
+                                seed_idx=ctx.get("seed_idx", 0)) > 0:
+                used = "SAM"
+        except Exception:
+            pass
     if used != "SAM":
-        import shutil
-        for f in sorted(os.listdir(ctx["orig_dir"])):
-            shutil.copy2(os.path.join(ctx["orig_dir"], f), os.path.join(frames_dir, f))
-    lines.append(f'matting: <b>{used}</b> · {len(os.listdir(frames_dir))} frames')
+        for f in sorted(os.listdir(ctx["orig"])):
+            shutil.copy2(os.path.join(ctx["orig"], f), os.path.join(frames_dir, f))
 
-    # 2) 推理(fps=30)+ 渲染
-    failed = False
-    for out in _cfg_and_infer(work, frames_dir, seq_name, d, ref_seq, lines, t0):
-        if out[0] == "__DONE__":
-            failed = out[1]; break
-        yield out
-    if failed:
-        yield term_html(lines), None, gr.update(); return
+    progress(0.15, desc="fetching character")
+    base = d["base"]
+    if _ensure_character(base, d["char_sub"], species) is None:
+        raise gr.Error("Character assets for this target are unavailable — pick another target.")
+    if not os.path.exists(_ensure_ref_bvh(base, d["sp_map"][species])):
+        raise gr.Error("Reference motion for this target isn't available yet — pick another target.")
 
-    # 3) 合成:原图 | 角色 mesh(camera)+ 配乐回填。无 Blender → numpy 合成片回退。
-    mesh_cam = glob.glob(os.path.join(work, "out", "**", "camera", "*rot6d_pred.mp4"), recursive=True)
-    comp = os.path.join(work, "dance_side.mp4")
-    if mesh_cam:
-        du.compose_side_by_side([ctx["std"], mesh_cam[0]], comp, height=480, fps=DANCE_FPS)
-    else:
-        bvh = next(iter(glob.glob(os.path.join(work, "out", "**", "*_rot6d_pred.bvh"), recursive=True)), None)
-        char_dir = os.path.join(d["base"], d.get("char_sub", "characters"), species)
-        rc = None
-        if render_composite is not None and bvh:
-            rc = render_composite(bvh, char_dir, ctx["std"], comp, fps=DANCE_FPS)
-        if not rc:
-            lines.append(f'<span style="{_S_ERR}">no character render (blender/composite)</span>')
-            yield term_html(lines), None, gr.update(); return
-        lines.append('render: <b>composite</b> (no Blender)')
+    cfg = load_yaml_config(BASE_CONFIG)
+    cfg["data"].update(base_dir=base,
+                       scale_dict_path=f"{base}/cache/__mesh2pose1002_species_scale_cache.pkl",
+                       character_dir=os.path.join(base, d["char_sub"]),
+                       bvh_roots=[f"{base}/bvh"],
+                       image_roots=[os.path.join(work, "frames")], wild_flag=True)
+    cfg["data"]["retarget"].update(ref_seq=d["sp_map"][species], ref_idx=0)
+    cfg["output"].update(save_dir=os.path.join(work, "out"), output_tag="dance",
+                         blender_path=None, fps=DANCE_FPS)
+    cfg["export_glb"] = False
+
+    steps = {"dino": 0.3, "v2p": 0.5, "p2r": 0.65, "plot": 0.75}
+    inference(cfg=cfg, device=dev, attention_design=cfg["model"]["attention_kwargs"],
+              model=_model, pipe=_pipe, rmbg_net=_rmbg, seq_name=seq_name,
+              image_folder=frames_dir,
+              stage_cb=lambda nm: progress(steps.get(nm, 0.6), desc=nm))
+
+    progress(0.85, desc="rendering character + music")
+    bvh = next(iter(glob.glob(os.path.join(work, "out", "**", "*_rot6d_pred.bvh"), recursive=True)), None)
+    if not bvh or render_composite is None:
+        raise gr.Error("Inference produced no motion — try another video.")
+    char = os.path.join(base, d["char_sub"], species)
+    rc = render_composite(bvh, char, ctx["std"], os.path.join(work, "dance_comp.mp4"), fps=DANCE_FPS)
+    if not rc:
+        raise gr.Error("Render failed — please retry.")
     outp = os.path.join(work, f"dance_{species[:16]}.mp4")
-    du.mux_audio(comp, ctx["audio"], outp)
-    tag_audio = "+audio" if ctx.get("audio") else "no-audio"
-    lines.append(f'<span style="{_S_GRN}">✔ {T()["done"]} {time.time()-t0:0.1f}s · {used} · 30fps · {tag_audio}</span>')
-    yield term_html(lines), outp, gr.update(value=outp, visible=True)
+    du.mux_audio(rc[0], ctx["audio"], outp)
+    progress(1.0, desc="done")
+    return outp, gr.update(value=outp, visible=True), gr.update(value=_share_html(species, "dresmp4"), visible=True)
 
 
-_CSS = (
-    # 整页居中
-    ".gradio-container{max-width:1520px!important;margin:0 auto!important}"
-    # 大标题 + 副标题
-    "#hdr{align-items:center;margin-bottom:8px}"
-    "#hdr h1{font-size:2rem;margin:0;line-height:1.2;font-weight:800}"
-    "#title p{font-size:1.02rem;opacity:.72;margin:3px 0 0;letter-spacing:.02em}"
-    "#lang{max-width:260px}"
-    # selbar 一排:顶部三项等高等宽、垂直居中
-    "#selbar{align-items:stretch!important}"
-    "#selbar>*{align-self:stretch!important}"
-    "#selbar button,#sel,#dsel{min-height:56px!important}"
-    # 状态框(Target/status):与按钮同高,内容居中,超长最多 2 行省略
-    "#sel,#dsel{display:flex!important;align-items:center;justify-content:center}"
-    "#sel p,#dsel p{text-align:center;font-size:.98rem;margin:0;opacity:.9;"
-    "display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}"
-    # 语言开关:横排一行
-    "#lang .wrap{display:flex!important;flex-flow:row wrap;align-items:center;gap:6px 16px}"
-    # 样例来源 / 目标角色 radio:纵列(一行一个)
-    "#exds .wrap,#refds .wrap,#drefds .wrap{display:flex!important;flex-flow:column;"
-    "align-items:flex-start;gap:8px}"
-    # 圆圈与文字垂直居中对齐
-    "#lang .wrap label,#exds .wrap label,#refds .wrap label,#drefds .wrap label"
-    "{display:inline-flex;align-items:center;gap:6px;margin:0}"
-    "#lang .wrap input,#exds .wrap input,#refds .wrap input,#drefds .wrap input{margin:0;flex:none}"
-    # tab 突出:更大 + 阴影 + 边框 + 选中高亮
-    ".tab-nav{gap:8px;border:0!important}"
-    ".tab-nav button,button[role=tab]{font-size:1.2rem!important;font-weight:700!important;"
-    "padding:10px 22px!important;border-radius:12px 12px 0 0!important;border:1px solid rgba(120,120,120,.25)!important;"
-    "box-shadow:0 3px 12px rgba(0,0,0,.16)!important}"
-    ".tab-nav button.selected,button[role=tab][aria-selected=true]{"
-    "box-shadow:0 6px 18px rgba(60,175,106,.38)!important;border-color:#3caf6a!important;"
-    "border-bottom:3px solid #3caf6a!important}"
-    # 各方块:阴影 + 圆角(边缘更清晰)
-    ".gradio-container .block{box-shadow:0 2px 12px rgba(0,0,0,.12)!important;border-radius:12px!important}"
-    # tab 行右侧的分享提示语(与 tab 标签同一排,负边距压到 tab-nav 行)
-    "#tabnote{box-shadow:none!important;background:transparent!important;border:0!important;"
-    "margin:0 4px -42px 0!important;text-align:right;position:relative;z-index:5;pointer-events:none}"
-    "#tabnote p{display:inline-block;margin:8px 0;color:#2c9a5a;font-weight:700;font-size:.98rem}"
-    # 「样例舞蹈」标题上色(与其它 label 一致的强调色)
-    "#dsamphdr{box-shadow:none!important;background:transparent!important;border:0!important;padding:0!important}"
-    "#dsamphdr p,#dsamphdr strong{color:#7c5cff;font-weight:700}"
-)
-_z = TXT["en"]   # 默认英文
-with gr.Blocks(title="MocapAnything V2 Demo", theme=gr.themes.Soft(), css=_CSS) as demo:
-    with gr.Row(elem_id="hdr"):
-        title_md = gr.Markdown(_z["title"], elem_id="title")
-        lang_ds = gr.Radio(choices=[("中文", "zh"), ("English", "en")], value="en",
-                           label=_z["lang"], interactive=True, scale=0, min_width=260, elem_id="lang")
-    species_state = gr.State(None)
+# ---------- share ----------
+SPACE_URL = "https://huggingface.co/spaces/kehong/MoCapAnythingV2"
 
-    tabnote_md = gr.Markdown(_z["share_note"], elem_id="tabnote")
+
+def _share_html(species, vid_elem="resmp4"):
+    """mobile: navigator.share attaches the video (IG/小红书/…); desktop: auto-download
+    the clip + open the X compose window. gradio 6 strips <script> from gr.HTML → the JS
+    lives inline in onclick. JS uses ONLY single quotes; the whole handler is html-escaped
+    and wrapped in a double-quoted onclick so inner quotes/& don't break the attribute."""
+    import urllib.parse as up
+    import html as _html
+    text = f"I just animated a {species} from a video with MoCapAnything V2! #MoCapAnythingV2"
+    u = up.quote(SPACE_URL); t = up.quote(text)
+    x = f"https://twitter.com/intent/tweet?text={t}&url={u}&hashtags=MoCapAnythingV2"
+    fb = f"https://www.facebook.com/sharer/sharer.php?u={u}"
+    btn = ("display:inline-flex;align-items:center;gap:6px;padding:8px 16px;margin:4px 6px 0 0;border:0;"
+           "border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;color:#fff;cursor:pointer;")
+    share_js = _html.escape(
+        "(async()=>{"
+        f"const v=document.querySelector('#{vid_elem} video');"
+        f"const msg='{text}';const url='{SPACE_URL}';"
+        "try{if(v&&v.src){const r=await fetch(v.src);const b=await r.blob();"
+        "const f=new File([b],'mocapanything.mp4',{type:'video/mp4'});"
+        "if(navigator.canShare&&navigator.canShare({files:[f]})){"
+        "await navigator.share({files:[f],text:msg,url:url});return;}"
+        "const a=document.createElement('a');a.href=URL.createObjectURL(b);"
+        "a.download='mocapanything.mp4';a.click();"
+        "setTimeout(()=>URL.revokeObjectURL(a.href),4000);}}catch(e){}"
+        f"window.open('{x}','_blank');" + "})()", quote=True)
+    copy_js = _html.escape(
+        f"navigator.clipboard.writeText('{SPACE_URL}');this.textContent='✓ Link copied';", quote=True)
+    return ('<div style="padding:8px 2px">'
+            '<span style="font-weight:600;margin-right:8px">✨ Like it? Share your result:</span><br>'
+            f'<button onclick="{share_js}" style="{btn}background:linear-gradient(90deg,#833ab4,#fd1d1d,#fcb045)">'
+            '📲 Share result video</button>'
+            f'<a href="{x}" target="_blank" style="{btn}background:#000">𝕏 / Twitter</a>'
+            f'<a href="{fb}" target="_blank" style="{btn}background:#1877f2">Facebook</a>'
+            f'<button onclick="{copy_js}" style="{btn}background:#e75480">📋 Copy link</button>'
+            '<div style="font-size:12px;opacity:.72;margin-top:8px;line-height:1.5">'
+            '📱 <b>Phone</b>: “Share result video” attaches the clip to Instagram / 小红书 / X directly.<br>'
+            '💻 <b>Desktop</b>: social sites can’t auto-attach video, so “Share result video” '
+            '<b>auto-downloads the clip</b> and opens the X post box — just <b>drag the downloaded '
+            'mocapanything.mp4 into the post</b> (or use ⬇ Download above).</div>'
+            '</div>')
+
+
+# ---------- UI ----------
+CSS = ".model3d-h{height:340px!important}"
+
+with gr.Blocks(title="MoCapAnything V2") as demo:
+    gr.Markdown(
+        "# 🐾 MoCapAnything V2 — Motion Capture & Retargeting for Arbitrary Skeletons\n"
+        "Pick a video (or **upload your own** — SAM2 isolates the subject), pick a **target "
+        "species/object** (can differ from the input → retargeting), hit **Run** — you get an "
+        "**interactive 3D pose skeleton** and **3D mesh** you can rotate, plus `.npy` / BVH.  \n"
+        "[Paper](https://huggingface.co/papers/2604.28130) · "
+        "[Code](https://github.com/phongdaot/MocapAnything) · "
+        "[Weights](https://huggingface.co/kehong/MoCapAnythingV2-weights)"
+        + ("" if BLENDER else " — install Blender for the photorealistic render.")
+    )
+    seg_ctx = gr.State(None)
+    subject_idx = gr.State(None)
+    species_st = gr.State(None)
+    dance_ctx = gr.State(None)
+    dance_pick_idx = gr.State(None)
+    active_tab = gr.State("mocap")
+
     with gr.Tabs():
-      # ========== Tab 1:Mocap / Retarget ==========
-      with gr.Tab("🎯 Mocap · Retarget"):
-        # 第 1 排:输入视频 | 参考 ref | 结果渲染
-        with gr.Row(equal_height=True):
-            video_in = gr.Video(label=_z["in_video"], height=280, scale=1)
-            ref_img = gr.Image(label=_z["ref"], height=280, interactive=False, scale=1)
-            result_out = gr.Video(label=_z["result"], height=280, autoplay=True, loop=True,
-                                  scale=3, elem_id="lresmp4")
+      with gr.Tab("🎯 Mocap · Retarget") as tab_mocap:
+        with gr.Row():
+            video_in = gr.Video(label="① Input video (upload / drag / pick a sample)", height=340,
+                                autoplay=True, loop=True)
+            skel_out = gr.Model3D(label="② 3D pose skeleton (drag to rotate)", elem_classes="model3d-h",
+                                  clear_color=[1.0, 1.0, 1.0, 1.0])
+            mesh_out = gr.Model3D(label="③ 3D mesh result (drag to rotate)", elem_classes="model3d-h",
+                                  clear_color=[1.0, 1.0, 1.0, 1.0])
+        subj_gallery = gr.Gallery(label="① b — SAM subject layers: click the subject to track (uploads)",
+                                  columns=8, height=150, object_fit="contain",
+                                  allow_preview=False, visible=False)
+        with gr.Row():
+            run_btn = gr.Button("🚀 Run", variant="primary", scale=2)
+            sel_md = gr.Markdown("No target selected")
+            dl_btn = gr.DownloadButton("⬇ Download (npy + BVH + glb)", visible=False, scale=2)
+        with gr.Row():
+            result_mp4 = gr.Video(label="🎬 Shareable clip — input | skeleton | mesh (synced, camera view)",
+                                  elem_id="resmp4", height=240, autoplay=True, loop=True, visible=False, scale=1)
+            share_html = gr.HTML(visible=False)
 
-        # 交互 3D(与 HF Space 同款,可旋转)+ share
-        with gr.Row(equal_height=True):
-            skel_out = gr.Model3D(label="🦴 3D pose skeleton (drag to rotate) · 3D骨架", height=260,
-                                  clear_color=[0.07, 0.07, 0.09, 1.0], scale=1)
-            mesh_out = gr.Model3D(label="🧊 3D mesh result (drag to rotate) · 3D网格", height=260,
-                                  clear_color=[0.07, 0.07, 0.09, 1.0], scale=1)
-            with gr.Column(scale=1):
-                share_html = gr.HTML(visible=False)
-
-        with gr.Row(elem_id="selbar", equal_height=False):
-            run_btn = gr.Button(_z["run"], variant="primary", size="lg", scale=2)
-            sel_label = gr.Markdown(_z["no_sel"], elem_id="sel")
-            dl_btn = gr.DownloadButton(_z["download"], size="lg", scale=2)
-
-        # 第 2 排:样例视频 | 目标物种画廊 | 运行终端
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=3):
-                ex_ds = gr.Radio(choices=_z["ex_choices"], value="wild", label=_z["ex_label"], interactive=True, elem_id="exds")
-                ex_gallery = gr.Gallery(value=[t for t, _ in EX["wild"]["gallery"]], columns=3, height=280,
-                                        object_fit="cover", show_label=False, allow_preview=False)
-            with gr.Column(scale=4):
-                ref_ds = gr.Radio(choices=_z["ref_choices"], value="zoo", label=_z["ref_label"], interactive=True, elem_id="refds")
-                species_gallery = gr.Gallery(value=[i for i, _ in DSET["zoo"]["gallery"]], columns=8, height=280,
-                                             object_fit="cover", show_label=False, allow_preview=False)
-            with gr.Column(scale=3):
-                term = gr.HTML(term_html([_z["idle"]]))
-
-      # ========== Tab 2:Dance Anything(布局与 Mocap 一致)==========
-      with gr.Tab("💃 Dance Anything"):
-        dance_ctx = gr.State(None)          # 分割上下文(帧目录/音轨/候选蒙版)
-        dance_pick_idx = gr.State(None)     # 选中的人物图层 index
-        dspecies_state = gr.State(None)     # 选中的目标角色
-        # 第 1 排:① 舞蹈视频 | ② 人物候选层(SAM,点选) | 🎬 结果(输入|角色 + 配乐)
-        with gr.Row(equal_height=True):
-            dance_video = gr.Video(label=_z["d_video"], height=280, scale=1)
-            dcand_gallery = gr.Gallery(label=_z["d_layers"], columns=2, height=280,
+      with gr.Tab("💃 Dance Anything") as tab_dance:
+        gr.Markdown("Dance video + music → **an animal / object performs the dance**. "
+                    "Upload (or pick a **dance sample below** ⬇) → SAM finds the dancer → click the "
+                    "person layer → pick a target character below → **Run dance**.")
+        with gr.Row():
+            dance_video = gr.Video(label="① Dance video (with audio)", height=300, scale=1)
+            dcand_gallery = gr.Gallery(label="② Person layers — click the dancer", columns=2, height=300,
                                        object_fit="contain", allow_preview=False, scale=1)
-            dance_out = gr.Video(label=_z["d_result"], height=280, autoplay=False, scale=3)
-        with gr.Row(elem_id="selbar", equal_height=False):
-            dmax = gr.Slider(3, 10, value=10, step=1, label=_z["d_maxsec"], scale=1)
-            drun_btn = gr.Button(_z["d_run"], variant="primary", size="lg", scale=2)
-            dstatus = gr.Markdown(_z["d_status0"], elem_id="dsel")
-            ddl_btn = gr.DownloadButton(_z["d_download"], size="lg", scale=2)
-        # 第 2 排:样例舞蹈(带音频) | 目标角色画廊 | 运行终端
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=3):
-                dsamp_md = gr.Markdown(_z["d_samples"], elem_id="dsamphdr")
-                dex_gallery = gr.Gallery(value=[t for t, _ in EX["dance"]["gallery"]], columns=3, height=280,
-                                         object_fit="cover", show_label=False, allow_preview=False)
-            with gr.Column(scale=4):
-                dref_ds = gr.Radio(choices=_z["ref_choices"], value="zoo",
-                                   label=_z["d_target"], interactive=True, elem_id="drefds")
-                dspecies_gallery = gr.Gallery(value=[i for i, _ in DSET["zoo"]["gallery"]], columns=8, height=280,
-                                              object_fit="cover", show_label=False, allow_preview=False)
-            with gr.Column(scale=3):
-                dterm = gr.HTML(term_html([_z["d_idle"]]))
+            dance_out = gr.Video(label="🎬 Result: input | skeleton | character (+music)", height=300,
+                                 autoplay=True, loop=True, scale=2, elem_id="dresmp4")
+        with gr.Row():
+            dmax = gr.Slider(3, 10, value=6, step=1, label="Max seconds", scale=1)
+            drun_btn = gr.Button("🚀 Run dance", variant="primary", scale=2)
+            dstatus = gr.Markdown("pick a dance sample below ⬇ (or upload) → click person layer → pick character → Run")
+            ddl_btn = gr.DownloadButton("⬇ Download", visible=False, scale=1)
+        dshare_html = gr.HTML(visible=False)
 
-    # ---- Tab1 交互 ----
-    lang_ds.change(on_lang_change, inputs=[lang_ds],
-                   outputs=[title_md, video_in, ref_img, result_out, run_btn, sel_label,
-                            dl_btn, ex_ds, ref_ds, term, tabnote_md,
-                            dance_video, dcand_gallery, dance_out, dmax, drun_btn, dstatus,
-                            ddl_btn, dsamp_md, dref_ds, dterm])
-    ex_ds.change(on_ex_change, inputs=[ex_ds], outputs=[ex_gallery])
-    ref_ds.change(on_ref_change, inputs=[ref_ds], outputs=[species_gallery, species_state, sel_label, ref_img])
-    ex_gallery.select(on_example_select, inputs=[ex_ds], outputs=[video_in])
-    species_gallery.select(on_species_select, inputs=[ref_ds], outputs=[species_state, sel_label, ref_img])
-    run_btn.click(run_inference, inputs=[video_in, species_state, ref_ds],
-                  outputs=[term, result_out, skel_out, mesh_out, dl_btn, share_html])
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("**Sample videos** — pick a source, click a thumbnail")
+            ex_ds = gr.Radio(choices=[(v["label"], k) for k, v in EXSET.items()],
+                             value="wild", label=None)
+            ex_gallery = gr.Gallery(value=EXSET["wild"]["items"], columns=3, height=220,
+                                    object_fit="cover", show_label=False, allow_preview=False)
+        with gr.Column(scale=1):
+            dset = gr.Radio(choices=[(v["label"], k) for k, v in DSET.items()],
+                            value="zoo", label="Target set")
+            species_gallery = gr.Gallery(value=[im for im, _ in DSET["zoo"]["gallery"][:GAL_DEFAULT]], columns=6,
+                                         height=380, object_fit="cover", show_label=False, allow_preview=False)
+            more_btn = gr.Button(f"▾ Load all {len(DSET['zoo']['gallery'])} targets", size="sm",
+                                 visible=len(DSET["zoo"]["gallery"]) > GAL_DEFAULT)
 
-    # ---- Tab2(Dance)交互:上传/点样例 → 自动 SAM 分割 → 点人物层 + 选角色 → Run ----
-    dance_video.upload(dance_segment, inputs=[dance_video, dmax],
-                       outputs=[dance_ctx, dcand_gallery, dstatus, dance_pick_idx])
-    dex_gallery.select(dance_example_load, inputs=[dmax],
-                       outputs=[dance_video, dance_ctx, dcand_gallery, dstatus, dance_pick_idx])
-    dcand_gallery.select(dance_pick, inputs=None, outputs=[dance_pick_idx, dstatus])
-    dref_ds.change(d_ref_change, inputs=[dref_ds], outputs=[dspecies_gallery, dspecies_state, dstatus])
-    dspecies_gallery.select(d_species_select, inputs=[dref_ds], outputs=[dspecies_state, dstatus])
-    drun_btn.click(run_dance, inputs=[dance_ctx, dance_pick_idx, dspecies_state, dref_ds],
-                   outputs=[dterm, dance_out, ddl_btn])
+    status = gr.Markdown("Pick or upload a video, then a target species. Uploads run SAM2 to isolate the subject.")
+
+    # tab switch re-targets the shared sample area
+    tab_mocap.select(lambda: ("mocap", gr.update(value="wild")), outputs=[active_tab, ex_ds])
+    tab_dance.select(lambda: ("dance", gr.update(value="dance")), outputs=[active_tab, ex_ds])
+
+    ex_ds.change(on_exset, inputs=[ex_ds], outputs=[ex_gallery])
+    ex_gallery.select(load_example, inputs=[ex_ds, active_tab],
+                      outputs=[video_in, seg_ctx, subject_idx, status, dance_video])
+    video_in.upload(segment_upload, inputs=[video_in], outputs=[seg_ctx, subj_gallery, status])
+    subj_gallery.select(pick_subject, outputs=[subject_idx, status])
+    dset.change(on_dset, inputs=[dset], outputs=[species_gallery, species_st, sel_md, more_btn])
+    more_btn.click(load_more, inputs=[dset], outputs=[species_gallery, more_btn])
+    species_gallery.select(on_species, inputs=[dset], outputs=[species_st, sel_md])
+    run_btn.click(run, inputs=[video_in, seg_ctx, subject_idx, dset, species_st],
+                  outputs=[skel_out, mesh_out, dl_btn, result_mp4, share_html])
+
+    dance_video.change(dance_segment, inputs=[dance_video, dmax],
+                       outputs=[dance_ctx, dcand_gallery, dstatus])
+    dcand_gallery.select(dance_pick, outputs=[dance_pick_idx, dstatus])
+    drun_btn.click(run_dance, inputs=[dance_ctx, dance_pick_idx, dset, species_st],
+                   outputs=[dance_out, ddl_btn, dshare_html])
+
+
+def main():
+    demo.queue(max_size=12).launch(
+        server_name=os.environ.get("APP_HOST", "0.0.0.0"),
+        server_port=int(os.environ.get("APP_PORT", "7860")) if not ZERO else None,
+        allowed_paths=[REPO, OUT, os.path.join(REPO, "demo"),
+                       DSET["zoo"]["base"], DSET["obj"]["base"],
+                       os.path.realpath(DSET["zoo"]["base"]), os.path.realpath(DSET["obj"]["base"])])
+
 
 if __name__ == "__main__":
-    demo.queue(max_size=8).launch(
-        server_name=os.environ.get("APP_HOST", "0.0.0.0"),
-        server_port=int(os.environ.get("APP_PORT", "7860")),
-        allowed_paths=[os.path.join(REPO, "demo"), os.path.join(REPO, "demo_outputs"),
-                       DSET["zoo"]["base"], DSET["obj"]["base"],
-                       os.path.realpath(DSET["zoo"]["base"]), os.path.realpath(DSET["obj"]["base"])],
-        share=False)
+    main()

@@ -78,9 +78,11 @@ def _iou(a, b):
     return float(inter) / float(union) if union else 0.0
 
 
-def candidate_layers(frame_path, out_dir, topk=8):
-    """对第 0 帧网格点自动分割,返回按分数排序的候选:
-    (overlay 预览图路径, 蒙版 bool 数组) 列表。失败返回 ([], [])(调用方回退 RMBG)。"""
+def candidate_layers(frame_path, out_dir, topk=8, prior=None):
+    """对指定帧网格点自动分割,返回候选:(overlay 预览图路径, 蒙版 bool 数组) 列表。
+    prior: 可选前景先验 bool mask(如 RMBG 输出)——候选按「前景重叠质量」排序
+    (∈前景比例×面积),整体主体排最前、部件其次、背景垫底。
+    失败返回 ([], [])(调用方回退 RMBG)。"""
     if _ensure() is not None:
         return [], []
     import torch
@@ -112,18 +114,34 @@ def candidate_layers(frame_path, out_dir, topk=8):
             scores = out.iou_scores[0].detach().cpu().numpy()  # [n_obj, 3]
             masks = masks.detach().cpu().numpy().astype(bool)
             for j in range(masks.shape[0]):
-                best = int(np.argmax(scores[j]))
-                seg = masks[j, best]
-                area = int(seg.sum())
-                if 0.008 * total < area < 0.9 * total:
-                    cand.append((float(scores[j, best]), area, seg))
+                # 3 个尺度(部件/子部件/整体)都进候选池:只挑最高分会把「整个人」
+                # 那档丢掉,候选里只剩短裤/上衣等部件。NMS 再去重。
+                for k in range(masks.shape[1]):
+                    seg = masks[j, k]
+                    area = int(seg.sum())
+                    if not (0.008 * total < area < 0.9 * total) or scores[j, k] <= 0.5:
+                        continue
+                    # 贴边过滤:墙面/地板等背景大块沿画面边缘大量延伸,主体几乎不贴边
+                    border = (seg[0, :].sum() + seg[-1, :].sum()
+                              + seg[:, 0].sum() + seg[:, -1].sum()) / (2.0 * (H + W))
+                    if border > 0.06:
+                        continue
+                    cand.append((float(scores[j, k]), area, seg))
     except Exception:
         import traceback
         traceback.print_exc()
         return [], []
 
-    # 按 (分数, 面积) 降序,贪心 NMS 去重(IoU>0.7 视为同一物体)
-    cand.sort(key=lambda c: (-c[0], -c[1]))
+    # 排序:有 prior → 前景重叠质量(∈前景比例×面积)降序:整体主体>部件>背景;
+    # 无 prior → (分数, 面积) 降序。贪心 NMS 去重(IoU>0.7 视为同一物体)。
+    if prior is not None and prior.shape == (H, W):
+        pr = prior.astype(bool)
+        def _key(c):
+            inside = float(np.logical_and(c[2], pr).sum()) / (c[1] + 1e-6)
+            return -(inside * c[1] / total)
+        cand.sort(key=_key)
+    else:
+        cand.sort(key=lambda c: (-c[0], -c[1]))
     kept = []
     for sc, ar, seg in cand:
         if all(_iou(seg, k[2]) < 0.7 for k in kept):
@@ -143,8 +161,9 @@ def candidate_layers(frame_path, out_dir, topk=8):
     return previews, segs
 
 
-def track_to_rgba(sam_frames_dir, seed_mask, orig_frames_dir, out_rgba_dir):
-    """用 seed_mask(第0帧)在 sam_frames_dir(jpg 帧)上跟踪全片,
+def track_to_rgba(sam_frames_dir, seed_mask, orig_frames_dir, out_rgba_dir, seed_idx=0):
+    """用 seed_mask(第 seed_idx 帧)在 sam_frames_dir(jpg 帧)上跟踪全片
+    (从 seed 帧向后 + 向前双向传播;seed 可取视频中段,避开片头标题卡),
     输出逐帧 RGBA(RGB=orig_frames_dir 原图, A=跟踪蒙版)到 out_rgba_dir。
     返回帧数;失败返回 0(调用方回退 RMBG)。"""
     if _ensure() is not None or seed_mask is None:
@@ -157,6 +176,7 @@ def track_to_rgba(sam_frames_dir, seed_mask, orig_frames_dir, out_rgba_dir):
                   if f.lower().endswith((".png", ".jpg")))
     if not sam_files:
         return 0
+    seed_idx = int(max(0, min(seed_idx, len(sam_files) - 1)))
     dev = _dev()
     _to(dev)
     frames = [Image.open(os.path.join(sam_frames_dir, f)).convert("RGB") for f in sam_files]
@@ -165,16 +185,20 @@ def track_to_rgba(sam_frames_dir, seed_mask, orig_frames_dir, out_rgba_dir):
     try:
         session = _vid_proc.init_video_session(video=frames, inference_device=dev)
         _vid_proc.add_inputs_to_inference_session(
-            inference_session=session, frame_idx=0, obj_ids=1,
+            inference_session=session, frame_idx=seed_idx, obj_ids=1,
             input_masks=torch.as_tensor(seed_mask, dtype=torch.bool))
         with torch.inference_mode():
-            _vid_model(inference_session=session, frame_idx=0)
-            for out in _vid_model.propagate_in_video_iterator(session):
-                m = _vid_proc.post_process_masks(
-                    [out.pred_masks],
-                    original_sizes=[[session.video_height, session.video_width]],
-                    binarize=True)[0]
-                frame_masks[out.frame_idx] = m[0].detach().cpu().numpy().astype(bool).squeeze()
+            _vid_model(inference_session=session, frame_idx=seed_idx)
+            def _collect(it):
+                for out in it:
+                    m = _vid_proc.post_process_masks(
+                        [out.pred_masks],
+                        original_sizes=[[session.video_height, session.video_width]],
+                        binarize=True)[0]
+                    frame_masks[out.frame_idx] = m[0].detach().cpu().numpy().astype(bool).squeeze()
+            _collect(_vid_model.propagate_in_video_iterator(session))                 # seed → 尾
+            if seed_idx > 0:
+                _collect(_vid_model.propagate_in_video_iterator(session, reverse=True))  # seed → 头
     except Exception:
         import traceback
         traceback.print_exc()
