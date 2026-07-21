@@ -629,9 +629,9 @@ def _share_html(species, vid_elem="resmp4"):
 # ---------- UI ----------
 CSS = ".model3d-h{height:340px!important}"
 
-with gr.Blocks(title="MoCapAnything V2") as demo:
+with gr.Blocks(title="MoCapAnything V2 — End-to-End Motion Capture & Retargeting for Arbitrary Skeletons") as demo:
     gr.Markdown(
-        "# 🐾 MoCapAnything V2 — Motion Capture & Retargeting for Arbitrary Skeletons\n"
+        "# 🐾 MoCapAnything V2 — End-to-End Motion Capture & Retargeting for Arbitrary Skeletons\n"
         "Pick a video (or **upload your own** — SAM2 isolates the subject), pick a **target "
         "species/object** (can differ from the input → retargeting), hit **Run** — you get an "
         "**interactive 3D pose skeleton** and **3D mesh** you can rotate, plus `.npy` / BVH.  \n"
