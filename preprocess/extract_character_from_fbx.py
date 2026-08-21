@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import subprocess
 from glob import glob
 
 import bpy
@@ -8,7 +9,34 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from utils.bvh_tools import face_forward_bvh_with_scale
+
+def face_forward_bvh_external(bvh_path, scale=0.01, out_path=None):
+    """Run the torch-dependent BVH post-process in the configured Python env.
+
+    Blender bundles its own Python without torch, so importing utils.bvh_tools
+    here would fail. Shell out to $PYTHON (the env you run the rest of the
+    pipeline with) instead. Writes to `out_path`, defaulting to in-place.
+    """
+    python_bin = os.environ.get('PYTHON', sys.executable)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(
+        [repo_root, env.get('PYTHONPATH', '')]
+    ).rstrip(os.pathsep)
+    code = (
+        "import sys; "
+        "from utils import bvh as BVH; "
+        "from utils.bvh_tools import face_forward_bvh_with_scale; "
+        "src, dst, scale = sys.argv[1], sys.argv[2], float(sys.argv[3]); "
+        "anim, names, frametime = BVH.load(src); "
+        "face_forward_bvh_with_scale(dst, anim, names, frametime, scale)"
+    )
+    subprocess.run(
+        [python_bin, '-c', code, bvh_path, out_path or bvh_path, str(scale)],
+        check=True,
+        cwd=repo_root,
+        env=env,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,10 +277,8 @@ def find_base_fbx(fbx_files, character_name):
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import utils.bvh as BVH  # kept for the optional face-forward step below
-
-    data_root = 'Truebone_Z-OO'
-    target_folder = 'zoo'
+    data_root = os.environ.get('DATA_ROOT', 'Truebone_Z-OO')
+    target_folder = os.environ.get('ZOO_ROOT', 'zoo')
     os.makedirs(target_folder, exist_ok=True)
 
     character_folder = os.path.join(target_folder, 'characters_fix_facezplus')
@@ -262,8 +288,11 @@ if __name__ == "__main__":
 
     skip_tpose = True
 
+    # Leading-underscore folders are bookkeeping, not characters: fix_fbx_batch.py
+    # drops _fix_meta_* / _fix_logs_* next to the fixed FBX it writes.
     character_dirs = sorted(
-        d for d in glob(os.path.join(data_root, "*")) if os.path.isdir(d)
+        d for d in glob(os.path.join(data_root, "*"))
+        if os.path.isdir(d) and not os.path.basename(d).startswith("_")
     )
 
     for char_dir in character_dirs:
@@ -297,6 +326,17 @@ if __name__ == "__main__":
         )
         bvh_joint_names = _read_bvh_joint_names(rest_bvh_path) if rest_bvh_path else None
 
+        # 1b) Face-forwarded + scaled copy of the rest pose. Inference reads this as
+        #     the rest-pose template (utils/npy2bvh.py looks for `*_ffs.bvh`); without
+        #     it BVH export fails, and substituting the unscaled rest.bvh silently
+        #     produces a collapsed mesh because the offsets are 100x too large.
+        if rest_bvh_path:
+            ffs_path = os.path.join(char_save_dir, f'{character_name}_ffs.bvh')
+            try:
+                face_forward_bvh_external(rest_bvh_path, scale=0.01, out_path=ffs_path)
+            except Exception as e:
+                print(f"⚠️ Could not write {os.path.basename(ffs_path)}: {e}")
+
         # 2) Mesh/weights/textures from the base FBX, weights aligned to BVH joints
         extract_character_data(base_fbx, char_save_dir, bvh_joint_names=bvh_joint_names)
 
@@ -313,10 +353,8 @@ if __name__ == "__main__":
                 if bvh_pth is None:
                     continue
 
-                # --- Optional: face-forward + scale pass on the freshly exported BVH ---
-                anim, name, ft = BVH.load(bvh_pth)
-                print(anim.rotations.shape)
-                face_forward_bvh_with_scale(bvh_pth, anim, name, ft, scale=0.01)
+                # --- Face-forward + scale pass on the freshly exported BVH ---
+                face_forward_bvh_external(bvh_pth, scale=0.01)
             except Exception as e:
                 print(e)
         print(f"✅ Done with {character_name}")

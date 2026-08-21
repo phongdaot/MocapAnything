@@ -1,0 +1,104 @@
+### examples/custom_rig/inference.yaml ###
+# Drive your own rig with in-the-wild footage, using the data that
+# examples/custom_rig/run.sh just produced under ./zoo.
+#
+# Differences from configs/inference/inference_video2pose2rot.yaml:
+#   - data.* point at ./zoo (your rig) instead of ./datasets/zoo1030
+#   - character_dir is characters_face_zplus (the aligned rest poses)
+#   - memory_pkl_path is empty: no FPS memory bank is built for a custom rig,
+#     so the model falls back to the reference frame
+#   - wild_flag + wild_mode are both true: no ground truth, reference skeleton
+#     resolved from the clip filename prefix
+#
+# Set BLENDER_BIN before running, or the mesh render is skipped:
+#   export BLENDER_BIN=/path/to/blender
+name: "Custom rig video2pose2rot inference"
+
+runtime:
+  device: "cuda"
+  dtype: "float16"
+  seed: 42
+
+weights:
+  video2pose_ckpt_root: "./checkpoints"
+  rmbg_weights_dir: "briaai/RMBG-1.4" # pulled from HF at runtime; use ./checkpoints/RMBG-1.4 if you mirrored it
+  ckpt_name: "video2pos2rot_epoch60.pt"
+
+experiment:
+  exp: ""
+
+model:
+  target: models.v2.video2pose2rot.model.Video2Pose2RotModel
+  params:
+
+    v2p_cfg:
+      target: models.v2.video2pose.model.RefGuidedVideo2PoseModel
+      params:
+        q_dim: 256
+        num_layers: 8
+        num_heads: 8
+        ref_layers: 4
+        img_dim: 1024
+        num_joints: 150
+        use_graph_ref_outer: false
+        use_graph_ref_inner: true
+        use_graph_temporal_outer: false
+        use_graph_temporal_inner: true
+        use_joint_embed: true
+
+    p2r_cfg:
+      target: models.v2.pose2rot.model.Pose2RotMemoryRestModel
+      params:
+        q_dim: 256
+        rest_layers: 4
+        pose_layers: 4
+        memory_layers: 4
+        decoder_layers: 8
+        num_heads: 8
+        joint_embed_dim: 768
+        temporal_window: 2
+        temporal_dropout: 0.1
+        decoder_cond_mode: add # add | concat
+        pose_rest_film: true
+        memory_rest_film: true
+        decoder_rest_film: true
+        pose_use_graph: true
+        use_grad_checkpoint: false
+        decoder_use_cross_layers: 6
+
+  attention_kwargs:
+    seq_len: 32
+    selfatt_temporal_layer_flag: []
+    selfatt_temporal: true
+    crossatt2_temporal: true
+    selfatt_slidwindow: 5
+    crossatt2_slidwindow: 5
+
+data:
+  base_dir: "./zoo"
+  character_dir: "./zoo/characters_face_zplus"
+  memory_pkl_path: ""
+  scale_dict_path: "./zoo/cache/__mesh2pose1002_species_scale_cache.pkl"
+  bvh_roots:
+    - "./zoo/bvh"
+
+  image_roots:
+    - "./videos"
+
+  retarget:
+    toggle: false
+    ref_seq: ""
+    ref_idx: 0
+
+  wild_flag: true # no ground truth: only the reference frame is used as input, and nothing is evaluated
+
+  wild_mode: true # reference skeleton is picked from base_dir by the clip's filename prefix ("MyRig#clip.mp4" -> any MyRig# sequence)
+
+  max_pts: 1024
+
+output:
+  blender_path: "./blender_mocapanything.sh" # honours $BLENDER_BIN; render is skipped if the binary is missing
+  save_dir: "./outputs/custom_rig"
+  fps: 15
+  export_gt_mesh: false
+  export_gt_video: false

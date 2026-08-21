@@ -23,8 +23,17 @@ rotations = [
 ]
 save_names = ['y0', 'y15', 'y30', 'y45', 'y60', 'y75', 'y90', 'y135', 'y180', 'y225', 'y270', 'y315']
 
-bvh_directory = 'zoo/motions'
-output_directory = 'zoo/bvh'
+ZOO_ROOT = os.environ.get('ZOO_ROOT', 'zoo')
+
+# Prefer the +Z-aligned motions produced by align_character_face_zplus.py — that is
+# what the released dataset was built from. Fall back to the raw motions/ so runs
+# that predate the alignment stage keep behaving exactly as before.
+_aligned = os.path.join(ZOO_ROOT, 'motions_face_zplus')
+bvh_directory = os.environ.get('BVH_SRC') or (
+    _aligned if os.path.isdir(_aligned) else os.path.join(ZOO_ROOT, 'motions')
+)
+output_directory = os.path.join(ZOO_ROOT, 'bvh')
+print(f'[rotate_bvh] source: {bvh_directory} -> {output_directory}')
 os.makedirs(output_directory, exist_ok=True)
 
 def rotate_bvh(base_bvh_path, rotation, save_path):
