@@ -8,13 +8,13 @@ runtime:
   seed: 42
 
 weights:
-  video2pose_ckpt_root: "./checkpoints/video2pose2rot"
+  video2pose_ckpt_root: "./checkpoints"
   triposg_weights_dir: "./checkpoints/TripoSG_temporal"
   rmbg_weights_dir: "./checkpoints/RMBG-1.4"
-  ckpt_name: "video2pos2rot_ckpt_best.pt"
+  ckpt_name: "video2pos2rot_epoch60.pt"
 
 experiment:
-  exp: "video2pos2rot_exp1_mixGT2Pred_detach_stage1stable"
+  exp: ""
 
 model:
   target: models.v2.video2pose2rot.model.Video2Pose2RotModel
@@ -24,7 +24,7 @@ model:
       target: models.v2.video2pose.model.RefGuidedVideo2PoseModel
       params:
         q_dim: 256
-        num_layers: 12
+        num_layers: 8
         num_heads: 8
         ref_layers: 4
         img_dim: 1024
@@ -42,7 +42,7 @@ model:
         rest_layers: 4
         pose_layers: 4
         memory_layers: 4
-        decoder_layers: 10
+        decoder_layers: 8
         num_heads: 8
         joint_embed_dim: 768
         temporal_window: 2
@@ -56,7 +56,7 @@ model:
         decoder_use_cross_layers: 6
   
   attention_kwargs:
-    seq_len: 24
+    seq_len: 32
     selfatt_temporal_layer_flag: []
     selfatt_temporal: true
     crossatt2_temporal: true
@@ -80,6 +80,8 @@ data:
     ref_idx: 0
   
   wild_flag: false # if true, no ground truth provided for inference, only reference frame is used as input, and the output will be saved in output folder without evaluation. If false, GT pose sequence will be provided as input, and the output will be evaluated against GT and saved in output folder.
+
+  wild_mode: false # if true, the reference skeleton is picked from base_dir by the species prefix of the input clip's filename ("MyRig#clip.mp4" -> any MyRig# sequence). Use this to drive a rig with in-the-wild footage that has no ground truth.
 
   max_pts: 1024
 

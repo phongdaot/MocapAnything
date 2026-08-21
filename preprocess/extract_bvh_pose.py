@@ -46,7 +46,7 @@ def get_scale_cached(bvh_pth, auto_scale='base_mesh'):
         scale = 1 / diameter
     elif auto_scale == 'base_mesh':
         base_mesh_path = get_base_mesh_path_from_bvh(bvh_pth)
-        temp_vertices, temp_faces = read_obj_mesh(base_mesh_path)
+        temp_vertices, *_ = read_obj_mesh(base_mesh_path)
         v_max, v_min = temp_vertices.max(axis=0), temp_vertices.min(axis=0)
         scale_factor = (v_max - v_min).max()
         scale = 1 / scale_factor

@@ -100,7 +100,8 @@ MocapAnything/
 ├── models/
 │   ├── v1/               # mesh2pose, video2mesh (TripoSG)
 │   └── v2/               # video2pose, video2pose2, pose2rot, video2pose2rot
-├── preprocess/           # Image preprocessing, background removal, data preparation
+├── preprocess/           # Raw FBX → training/inference data (see preprocess/README.md)
+├── examples/custom_rig/  # Bring your own rigged FBX: walkthrough, runner, inference config
 ├── train/                # Training entrypoints (one per stage)
 ├── inference/            # Inference entrypoints (one per stage)
 └── utils/                # Common utilities: loss, rotation, mesh, BVH, visualization, etc.
@@ -144,7 +145,29 @@ datasets/zoo1030/
 └── cache/                            # Per-species scale cache
 ```
 
-Use `preprocess/preprocess_data.py` to build mesh and image caches from raw sequences. The released end-to-end model trains without FPS memory banks (it conditions on the reference frame directly), so `num_memory: -1` in the config; per-species memory banks are only needed for the standalone `pose2rot` variants.
+Every one of those files is produced by `preprocess/run_pipeline.sh`, starting from raw FBX — see [`preprocess/README.md`](preprocess/README.md) for the stage-by-stage breakdown. The two that inference refuses to start without:
+
+| File | Built by |
+|---|---|
+| `species_info_dict.npy` | `preprocess/build_species_info.py` (stage 7) — skeleton topology, joint-name T5 embeddings, static joints |
+| `cache/__mesh2pose1002_species_scale_cache.pkl` | `preprocess/build_scale_cache.py` (stage 8) — per-species normalization scale |
+
+The released end-to-end model trains without FPS memory banks (it conditions on the reference frame directly), so `num_memory: -1` in the config; per-species memory banks are only needed for the standalone `pose2rot` variants.
+
+### Using your own rigged character
+
+The pipeline is not tied to this dataset. Point it at your own FBX and it produces the same
+artifacts, which is all inference needs:
+
+```bash
+export BLENDER=/path/to/blender PYTHON=/path/to/torch/python
+bash examples/custom_rig/run.sh MyRig
+python -m inference.video2pose2rot --config examples/custom_rig/inference.yaml
+```
+
+See [`examples/custom_rig/README.md`](examples/custom_rig/README.md) for what to prepare,
+what each stage produces, and what to do when the automatic facing-direction or leaf-bone
+guesses come out wrong.
 
 ## Training
 
@@ -190,6 +213,8 @@ Inference scripts read the same YAML configs (inference variants) and operate on
 - **Evaluation mode** (`data.wild_flag: false`) — compares predictions against GT sequences and reports metrics.
 - **Wild mode** (`data.wild_flag: true`) — runs on in-the-wild image sequences using only a reference pose.
 
+In wild mode, also set `data.wild_mode: true` to have the reference skeleton resolved from the clip filename: `MyRig#clip.mp4` picks any `MyRig#` sequence out of `data.base_dir`. Without it, a clip whose species has no ground-truth entry is skipped with a `[SKIP] ... ref bvh_pose` warning.
+
 ```bash
 # Video → Mesh
 python -m inference.video2mesh --config configs/inference/inference_video2mesh.yaml
@@ -202,6 +227,9 @@ python -m inference.video2pose --config configs/inference/inference_video2pose.y
 
 # End-to-end Video → Pose → Rotation (outputs BVH)
 python -m inference.video2pose2rot --config configs/inference/inference_video2pose2rot.yaml
+
+# Your own rig, driven by in-the-wild footage
+python -m inference.video2pose2rot --config examples/custom_rig/inference.yaml
 ```
 
 Outputs are written to `output.save_dir` and include predicted pose `.npz` files, rotation sequences, BVH files, and (if Blender is configured) rendered comparison videos.

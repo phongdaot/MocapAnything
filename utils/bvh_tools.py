@@ -1,3 +1,6 @@
+import json
+import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -6,6 +9,11 @@ import torch
 from . import animation as animation
 from . import bvh as BVH
 from .transforms3d import *
+
+
+def save_json(pth, dict_list):
+    with open(pth, 'w', encoding='utf-8') as f:
+        json.dump(dict_list, f, ensure_ascii=False, indent=4)
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +319,178 @@ def get_diameter(parents, bone_length):
 
     b_l, b_p = get_one_end(a_p[-1], [])
     return b_l, b_p
+
+
+def compute_rest_joints(offsets: np.ndarray, parents: np.ndarray) -> np.ndarray:
+    """
+    Compute global joint positions in T-pose from BVH offsets and parent structure.
+    """
+    J = offsets.shape[0]
+    joints = np.zeros((J, 3))
+    for j in range(J):
+        if parents[j] < 0:
+            joints[j] = offsets[j]
+        else:
+            joints[j] = joints[parents[j]] + offsets[j]
+    return joints
+
+
+# --------------For Quadruped Restpose Alignment and Motion Mirroring ----------------------
+def fit_symmetry_plane(mid_joints_positions):
+    """
+    mid_joints_positions: (N,3)，顺序为 pelvis -> spine1 -> spine2 -> ...（已按从下到上或你定义的正向排序）
+    返回:
+      n:       (3,) 对称平面法向量（符号仍然不定，通常不强求）
+      mean:    (3,) 中心
+      v_spine: (3,) 脊柱主方向（已按输入顺序定向：第1点 -> 最后1点）
+      v_proj:  (3,) v_spine 在对称平面上的单位投影（与 v_spine 同号）
+    """
+    P = np.asarray(mid_joints_positions, dtype=np.float64)
+    mean = P.mean(axis=0)
+    X = P - mean
+
+    C = X.T @ X
+    eigvals, eigvecs = np.linalg.eigh(C)
+
+    # 最小方差 -> 平面法向；最大方差 -> 沿脊柱
+    n = eigvecs[:, 0]
+    v_spine = eigvecs[:, -1]
+
+    # 用“首尾向量”给 v_spine 定向（按你提供的顺序）---
+    ref_vec = P[-1] - P[0]  # pelvis → 最后一个脊柱点
+    if np.linalg.norm(ref_vec) > 0 and np.dot(v_spine, ref_vec) < 0:
+        v_spine = -v_spine
+
+    # 在对称平面上的投影，并用同一个参照向量的投影定向
+    v_proj = v_spine - n * np.dot(v_spine, n)
+    v_proj_norm = np.linalg.norm(v_proj)
+    v_proj /= v_proj_norm
+
+    return n, mean, v_spine / np.linalg.norm(v_spine), v_proj
+
+
+def quadruped_character_restpose_alignment(bvh_pth, save_dir, front=None):
+    character_align = False
+    file_name = os.path.basename(bvh_pth)
+    anim, names, frametime = BVH.load(bvh_pth)
+    pos_at_restpose = compute_rest_joints(anim.offsets, anim.parents)
+
+    if not type(front) == np.ndarray:
+        center, symmetry = find_symmetry(bvh_pth)
+        n, mean, v_spine, front = fit_symmetry_plane(
+            pos_at_restpose[np.array(center), :][1:]
+        )
+        symmetry_info = {'center': center, 'symmetry': symmetry}
+        save_json(save_dir + '/symmetry_info.json', [symmetry_info])
+
+    np.save(save_dir + '/front.npy', front)
+    mesh_pth = os.path.dirname(bvh_pth) + '/base_mesh.obj'
+    if os.path.exists(mesh_pth):
+        character_align = True
+
+    def rot_y(angle):
+        c, s = np.cos(angle), np.sin(angle)
+        return np.array(
+            [[c, 0., s], [0., 1., 0.], [-s, 0., c]], dtype=np.float64
+        )
+
+    global_trans = animation.transforms_global(anim)
+    global_pos = global_trans[:, :, :3, 3] / global_trans[:, :, 3, 3:]
+    # 1) 只绕Y对齐 front 到 +Z（避免 qbetween 的 180°退化）
+    front_y = front.copy()
+    front_y[1] = 0.0
+    nrm = np.linalg.norm(front_y)
+    if nrm < 1e-8:
+        yaw = 0.0 if front[2] >= 0 else np.pi
+    else:
+        front_y /= nrm
+        yaw = np.arctan2(front_y[0], front_y[2])  # from +Z to front_y
+    R = rot_y(yaw)  # 把 front 旋到 +Z；行向量右乘 v' = v @ R
+
+    # 2) offsets（restpose）在新基底
+    joints_pos_rot = pos_at_restpose @ R
+    offsets_list = [joints_pos_rot[0][None]]
+    for i in range(1, joints_pos_rot.shape[0]):
+        offsets_list.append(
+            (joints_pos_rot[i] - joints_pos_rot[anim.parents[i]])[None]
+        )
+    offsets = np.concatenate(offsets_list, axis=0)  # (J,3)
+
+    # 3) 所有关节局部旋转做换基：R_i' = R^T @ R_i @ R（行向量/右乘）
+    rotation_q = torch.from_numpy(anim.rotations.qs)  # (T,J,4)
+    rot_mat = quaternion_to_matrix(rotation_q)  # (T,J,3,3)
+    R_t = torch.tensor(R, dtype=rot_mat.dtype, device=rot_mat.device)
+    R_inv = R_t.t()
+    # 左乘 R^T
+    rot_mat = torch.einsum('ab,tjbc->tjac', R_inv, rot_mat)
+    # 右乘 R
+    rot_mat = torch.einsum('tjab,bc->tjac', rot_mat, R_t)
+
+    # 4) 根平移随 R 旋，其它关节平移为 0（BVH 规范）
+    seq_len = rot_mat.shape[0]
+    J = offsets.shape[0]
+    transl = (anim.positions - np.tile(anim.offsets,
+                                       (seq_len, 1, 1)))[:, 0]  # (T,3)
+    transl_rot = transl @ R  # (T,3)
+    positions = np.zeros((seq_len, J, 3), dtype=np.float32)
+    positions[:, 0] = transl_rot + anim.offsets[0][None]
+
+    # 5) 回欧拉（顺序与 BVH 'order' 完全一致）
+    euler = matrix_to_euler_angles(rot_mat, 'ZYX').cpu().numpy()
+    euler = np.degrees(euler)
+
+    bvh_data = {
+        'rotations': euler,
+        'positions': positions,
+        'offsets': offsets,
+        'parents': anim.parents,
+        'names': names,
+        'order': 'zyx',
+        'frametime': frametime,
+    }
+
+    # 6 转mesh, character 迁移 (如果有)
+    if character_align:
+        character_dir = os.path.dirname(bvh_pth)
+        shutil.copytree(character_dir, save_dir, dirs_exist_ok=True)
+        mesh_save_pth = os.path.join(save_dir, 'base_mesh.obj')
+        _rotate_obj_vertices_and_normals(mesh_pth, mesh_save_pth, R)
+
+    save_pth = os.path.join(save_dir, file_name)
+    BVH.save_dict(save_pth, bvh_data, fps=30)
+
+
+def _rotate_obj_vertices_and_normals(src_obj_path, dst_obj_path, R):
+    """
+    读取 .obj，行向量右乘：v' = v @ R, vn' = vn @ R；vt 不变；其它行原样抄写。
+    只处理 'v', 'vn', 'vt', 'f', 'usemtl', 'mtllib', 'o', 'g', 's' 常见行。
+    """
+    R = np.asarray(R, dtype=np.float64)
+    out_lines = []
+    with open(src_obj_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            if line.startswith('v '):  # 顶点
+                parts = line.strip().split()
+                v = np.array(list(map(float, parts[1:4])), dtype=np.float64)
+                v = v @ R
+                out_lines.append(f'v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n')
+            elif line.startswith('vn '):  # 法线
+                parts = line.strip().split()
+                n = np.array(list(map(float, parts[1:4])), dtype=np.float64)
+                n = n @ R
+                # 归一化，避免数值误差
+                nn = np.linalg.norm(n)
+                if nn > 0:
+                    n /= nn
+                out_lines.append(f'vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n')
+            else:
+                # 其它（vt/f/材质/组等）原样抄写
+                out_lines.append(line)
+
+    os.makedirs(os.path.dirname(dst_obj_path), exist_ok=True)
+    with open(dst_obj_path, 'w', encoding='utf-8') as f:
+        f.writelines(out_lines)
+
 
 
 if __name__ == '__main__':

@@ -21,9 +21,30 @@ from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from models.v1.video2mesh.pipeline_triposg import TripoSGPipeline
+try:
+    from models.v1.video2mesh.pipeline_triposg import TripoSGPipeline
+except Exception:  # TripoSG not installed / not on PYTHONPATH
+    TripoSGPipeline = None
+
 from preprocess.briarmbg import BriaRMBG
 from preprocess.image_process import prepare_image
+
+
+class Dinov2Only:
+    """The DINOv2 half of TripoSGPipeline, loaded straight from `facebook/dinov2-large`.
+
+    This stage only ever touches `feature_extractor_dinov2` / `image_encoder_dinov2`,
+    which are exactly that model — so pulling in TripoSG and its geometry weights just
+    to reach them makes the mesh-free path depend on something it never uses.
+    """
+
+    def __init__(self, device, dtype, model_id="facebook/dinov2-large"):
+        from transformers import AutoImageProcessor, Dinov2Model
+
+        self.feature_extractor_dinov2 = AutoImageProcessor.from_pretrained(model_id)
+        self.image_encoder_dinov2 = (
+            Dinov2Model.from_pretrained(model_id).to(device, dtype).eval()
+        )
 
 
 def process_sample(img_files, pipe, rmbg_net, device, dtype, out_file):
@@ -77,6 +98,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_root", type=str, default="zoo",
                         help="dataset root containing image/")
     parser.add_argument("--triposg_weights_dir", type=str, default="checkpoints/TripoSG")
+    parser.add_argument("--dinov2_model", type=str, default="facebook/dinov2-large",
+                        help="fallback image encoder, used when TripoSG is unavailable")
     parser.add_argument("--rmbg_weights_dir", type=str, default="checkpoints/RMBG-1.4")
     args = parser.parse_args()
 
@@ -94,11 +117,18 @@ if __name__ == "__main__":
     device = "cuda"
     dtype = torch.float16
 
-    rmbg_net = BriaRMBG.from_pretrained(args.rmbg_weights_dir).to(device)
+    # The weights repo does not ship RMBG; fall back to the HuggingFace id it lives at.
+    rmbg_src = args.rmbg_weights_dir if os.path.isdir(args.rmbg_weights_dir) else "briaai/RMBG-1.4"
+    print(f"Loading background remover from {rmbg_src}")
+    rmbg_net = BriaRMBG.from_pretrained(rmbg_src).to(device)
     rmbg_net.eval()
 
-    print("Loading TripoSG pipeline (DINOv2 image encoder only)...")
-    pipe = TripoSGPipeline.from_pretrained(args.triposg_weights_dir).to(device, dtype)
+    if TripoSGPipeline is not None and os.path.isdir(args.triposg_weights_dir):
+        print("Loading TripoSG pipeline (DINOv2 image encoder only)...")
+        pipe = TripoSGPipeline.from_pretrained(args.triposg_weights_dir).to(device, dtype)
+    else:
+        print(f"Loading {args.dinov2_model} directly (TripoSG not available).")
+        pipe = Dinov2Only(device, dtype, model_id=args.dinov2_model)
 
     view_pairs = find_view_dirs(image_folder)
     view_pairs = [p for i, p in enumerate(view_pairs) if i % args.num_shards == args.shard]

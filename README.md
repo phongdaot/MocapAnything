@@ -76,6 +76,21 @@ python demo/app.py            # http://localhost:7860
 
 > The 3D mesh render needs a portable [Blender](https://www.blender.org/download/) build (4.x/5.x): extract it and `export BLENDER_BIN=/path/to/blender` — without it you still get pose `.npy` + BVH + skeleton videos. Checkpoints and datasets live on HuggingFace; only code ships in this repo. The background remover (`briaai/RMBG-1.4`) and DINOv2 auto-download on first run. If torch complains your NVIDIA driver is too old, install a build matching your driver from [pytorch.org](https://pytorch.org/get-started/locally/) (tested: `torch==2.9.0`).
 
+## Use your own rigged character
+
+The preprocessing pipeline is not tied to the released datasets. Point it at your own rigged
+FBX and it produces the same artifacts inference consumes — skeleton topology, joint-name
+embeddings, reference poses — so you can drive *your* rig with in-the-wild footage.
+
+```bash
+export BLENDER=/path/to/blender PYTHON=/path/to/torch/python
+bash examples/custom_rig/run.sh MyRig
+python -m inference.video2pose2rot --config examples/custom_rig/inference.yaml
+```
+
+Walkthrough, required file layout, and troubleshooting: **[examples/custom_rig/README.md](examples/custom_rig/README.md)**.
+Stage-by-stage reference: **[preprocess/README.md](preprocess/README.md)**.
+
 ## Install & Run
 
 Environment setup, dataset layout, training commands, and inference (including in-the-wild mode) live in **[RUN.md](RUN.md)**.
