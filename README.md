@@ -135,4 +135,14 @@ If you build on the V1 baselines, please also cite the underlying papers — `me
 
 ## License
 
-See the repository for license information.
+MIT — see [LICENSE](LICENSE). The released V2 weights are MIT as well.
+
+Two things in the pipeline are **not** covered by that grant and follow their own
+terms: `preprocess/briarmbg.py` (RMBG-1.4, © BRIA AI) and the Truebones Zoo
+motion data. See the third-party notice in [LICENSE](LICENSE).
+
+## Acknowledgements
+
+Animal motion data: [Truebones Zoo](https://truebones.gumroad.com/l/skZMC) by
+Truebones Motions Animation Studios. Motion files are not redistributed with
+this project.
