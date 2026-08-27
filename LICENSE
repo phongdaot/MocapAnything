@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Dao Thien Phong
+Copyright (c) 2026 Kehong Gong
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+--- THIRD-PARTY NOTICES ---
+
+preprocess/briarmbg.py is a copy of the RMBG-1.4 network definition from
+briaai/RMBG-1.4 (https://huggingface.co/briaai/RMBG-1.4). Copyright belongs to
+BRIA AI and it is licensed under BRIA's own terms, NOT the MIT licence above.
+
+RMBG-1.4 weights, facebook/dinov2-large and facebook/sam2.1-hiera-* are
+downloaded at runtime from their own repositories under their own licences and
+are not redistributed by this project.
+
+Animal motion data is derived from Truebones Zoo
+(https://truebones.gumroad.com/l/skZMC) and is subject to Truebones' terms.
