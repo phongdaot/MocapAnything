@@ -95,6 +95,8 @@ Stage-by-stage reference: **[preprocess/README.md](preprocess/README.md)**.
 
 Environment setup, dataset layout, training commands, and inference (including in-the-wild mode) live in **[RUN.md](RUN.md)**.
 
+Reproduction commands, the expected metrics for the released checkpoint, and how they differ from the paper: **[RUN.md → Metrics & Reproduction](RUN.md#metrics--reproduction)**.
+
 ## Citation
 
 If you use this code, please consider cite:

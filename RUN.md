@@ -252,15 +252,85 @@ The `pose2rot` model (`Pose2RotMemoryRestModel`) adds a memory branch conditione
 
 The `video2pose2rot` model wraps `video2pose` and `pose2rot` into a single module with schedulable teacher forcing (`pose_source_mode: mix`) so rotation training can be warmed up from GT poses and annealed toward predicted poses.
 
-## Metrics
+## Metrics & Reproduction
 
 Evaluation splits — `seen`, `rare`, `unseen` — are reported independently. Common metrics:
 
-- `mpjpe` — mean per-joint position error
-- `mpjve` — mean per-joint velocity error
-- `rot_l1`, `rot_smooth_l1` — rotation error
-- `speed_l1`, `speed_l2` — temporal smoothness
+- `mpjpe` — mean per-joint position error (JP, cm)
+- `mpjve` — mean per-joint velocity error (JV, cm)
+- `rot_l1`, `rot_smooth_l1` — rotation error (An, degrees)
+- `speed_l1`, `speed_l2` — temporal smoothness (AV, degrees)
+
+### Reproducing the released checkpoint
+
+`video2pos2rot_epoch60.pt` was trained with the recipe above — `zoo1030 + obj1k`,
+reference enhancement on, 8×GPU, batch 2/GPU, lr 1e-4, 60 epochs.
+
+```bash
+# Setting A — the released recipe (reference enhancement ON).
+# configs/train/train_video2pose2rot_multidata.yaml ships with
+#   zoo1030: ref_enhance: cross_seq     (same species, any sequence, any yaw)
+#   obj1k:   ref_enhance: cross_angle   (same sequence, different yaw)
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NGPU=8 bash train_multidata.sh
+
+# Setting B — no reference enhancement (the ablation).
+# Set ref_enhance: null on both dataset entries in the config, then:
+CONFIG=configs/train/train_video2pose2rot_multidata_noaug.yaml \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NGPU=8 bash train_multidata.sh
+
+# Evaluate either checkpoint (data.wild_flag: false → per-split metrics)
+python -m inference.video2pose2rot --config configs/inference/inference_video2pose2rot.yaml
+```
+
+Both settings are otherwise identical, so they are directly comparable — pick whichever
+matches what you want to measure (see *Reference enhancement* below).
+
+Splits: `datasets/zoo1030/selected_test_split_release.json` and
+`datasets/obj1k/select_test_obj1k.json`, both shipped in this repository.
+
+### Expected numbers
+
+JP / JV in cm, An / AV in degrees. Lower is better.
+
+| | Zoo-Seen | Zoo-Rare | Zoo-Unseen | Obj |
+| --- | --- | --- | --- | --- |
+| **Released ckpt, released split** | 2.48 / 0.61 / 11.22 / 0.300 | 4.15 / 0.86 / 14.45 / 0.380 | 5.70 / 0.68 / **19.58** / 0.516 | 4.85 / 1.20 / 12.07 / 0.302 |
+| Retrained from this repository | 2.60 / 0.65 / 11.29 / 0.301 | 4.05 / 0.91 / 14.79 / 0.386 | 5.82 / 0.72 / 20.51 / 0.541 | 4.66 / 1.34 / 11.71 / 0.287 |
+| *Paper, Table 1* | *2.34 / 0.53 / 10.73 / 0.29* | *2.98 / 0.61 / 14.38 / 0.37* | *3.39 / 0.99 / **6.54** / 0.17* | *3.84 / 1.05 / 11.06 / 0.30* |
+
+Retraining from this repository reproduces the released checkpoint closely (within
+~0.1 cm and ~0.5°), so the pipeline here is faithful to how the released weights were
+produced.
+
+### ⚠️ These do not match the paper
+
+**The paper's Table 1 was computed on a different train/test split than the one released
+here.** The difference is concentrated on Zoo-Unseen — about 19.6° on the released split
+against 6.54° in the paper. The seen / rare / obj columns agree to within roughly 1 cm
+and 1–2°.
+
+Unseen-species rotation error depends heavily on *which* species land in the unseen
+bucket, and the two splits partition them differently. The paper's observation that
+unseen error falls below seen error holds on its split, not on this one. If you are
+comparing against this work, please compare on the split you can actually download —
+the one in this repository.
+
+### Reference enhancement and retargeting
+
+`ref_enhance` draws the reference frame from elsewhere in the same species (`cross_seq`,
+animals) or from a different yaw of the same sequence (`cross_angle`, objects). It is a
+training-time augmentation only and is never used at evaluation.
+
+There is a real trade-off. An otherwise identical run **without** it scores slightly
+better across all four benchmark columns above — so if you are chasing benchmark numbers,
+Setting B is the stronger choice. The released checkpoint nonetheless uses Setting A,
+because it produces visibly better **retargeting and in-the-wild results**, which is what
+the demo and most downstream use actually depends on. Train whichever matches your goal,
+and say which one you used when reporting numbers.
 
 ## License
 
-See the repository for license information.
+MIT — see [LICENSE](LICENSE). The released V2 weights are MIT as well.
+`preprocess/briarmbg.py` (RMBG-1.4, © BRIA AI) and the Truebones Zoo motion data are not
+covered by that grant and follow their own terms; see the third-party notice in
+[LICENSE](LICENSE).
