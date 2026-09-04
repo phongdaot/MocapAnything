@@ -263,27 +263,24 @@ Evaluation splits — `seen`, `rare`, `unseen` — are reported independently. C
 
 ### Reproducing the released checkpoint
 
-`video2pos2rot_epoch60.pt` was trained with the recipe above — `zoo1030 + obj1k`,
-reference enhancement on, 8×GPU, batch 2/GPU, lr 1e-4, 60 epochs.
+We release **Setting A**. Two settings were trained; both are described below and both
+can be run from this repository, so you can reproduce either and compare.
 
 ```bash
-# Setting A — the released recipe (reference enhancement ON).
-# configs/train/train_video2pose2rot_multidata.yaml ships with
-#   zoo1030: ref_enhance: cross_seq     (same species, any sequence, any yaw)
-#   obj1k:   ref_enhance: cross_angle   (same sequence, different yaw)
+# Setting A — the released recipe. This is what video2pos2rot_epoch60.pt is.
+# configs/train/train_video2pose2rot_multidata.yaml already carries it.
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NGPU=8 bash train_multidata.sh
 
-# Setting B — no reference enhancement (the ablation).
-# Set ref_enhance: null on both dataset entries in the config, then:
-CONFIG=configs/train/train_video2pose2rot_multidata_noaug.yaml \
+# Setting B — copy that config and change three values:
+#   datasets[*].ref_enhance  -> null
+#   loss.root_wt             -> 0.1
+#   loss.root_rot_v_wt       -> 0.0
+CONFIG=configs/train/my_setting_b.yaml \
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NGPU=8 bash train_multidata.sh
 
 # Evaluate either checkpoint (data.wild_flag: false → per-split metrics)
 python -m inference.video2pose2rot --config configs/inference/inference_video2pose2rot.yaml
 ```
-
-Both settings are otherwise identical, so they are directly comparable — pick whichever
-matches what you want to measure (see *Reference enhancement* below).
 
 Splits: `datasets/zoo1030/selected_test_split_release.json` and
 `datasets/obj1k/select_test_obj1k.json`, both shipped in this repository.
@@ -294,7 +291,8 @@ JP / JV in cm, An / AV in degrees. Lower is better.
 
 | | Zoo-Seen | Zoo-Rare | Zoo-Unseen | Obj |
 | --- | --- | --- | --- | --- |
-| **Released ckpt, released split** | 2.48 / 0.61 / 11.22 / 0.300 | 4.15 / 0.86 / 14.45 / 0.380 | 5.70 / 0.68 / **19.58** / 0.516 | 4.85 / 1.20 / 12.07 / 0.302 |
+| **Setting A — released ckpt** | 2.48 / 0.61 / 11.22 / 0.300 | 4.15 / 0.86 / 14.45 / 0.380 | 5.70 / 0.68 / **19.58** / 0.516 | 4.85 / 1.20 / 12.07 / 0.302 |
+| Setting B — ep50 | 2.33 / 0.56 / 10.08 / 0.269 | 3.45 / 0.82 / 12.66 / 0.335 | 4.45 / 0.60 / 15.36 / 0.410 | 4.29 / 1.22 / 9.82 / 0.242 |
 | Retrained from this repository | 2.60 / 0.65 / 11.29 / 0.301 | 4.05 / 0.91 / 14.79 / 0.386 | 5.82 / 0.72 / 20.51 / 0.541 | 4.66 / 1.34 / 11.71 / 0.287 |
 | *Paper, Table 1* | *2.34 / 0.53 / 10.73 / 0.29* | *2.98 / 0.61 / 14.38 / 0.37* | *3.39 / 0.99 / **6.54** / 0.17* | *3.84 / 1.05 / 11.06 / 0.30* |
 
@@ -308,15 +306,33 @@ The paper's Table 1 used a different train/test split. The gap is concentrated o
 Zoo-Unseen — ~19.6° here against 6.54° there; seen / rare / obj agree to within about
 1 cm and 1–2°. Compare on the split shipped in this repository.
 
-### Reference enhancement
+### Training settings
 
-`ref_enhance` draws the reference frame from elsewhere in the same species
-(`cross_seq`, animals) or a different yaw of the same sequence (`cross_angle`,
-objects). Training-time only — never used at evaluation.
+Both settings share everything below; they differ only in the four rows of the second
+table. `ref_enhance` is a training-time augmentation — it draws the reference frame
+from elsewhere in the same species (`cross_seq`, animals) or a different yaw of the
+same sequence (`cross_angle`, objects), and is never used at evaluation.
 
-Setting B scores slightly better on all four benchmark columns; Setting A gives
-better retargeting and in-the-wild results, which is why the released checkpoint
-uses it. Say which one you used when reporting numbers.
+| | |
+| --- | --- |
+| Data | `zoo1030` + `obj1k` (`use_mobjaverse 0`), released splits, no memory bank |
+| Video→Pose | 8 layers, `q_dim` 256, 8 heads, 4 reference layers, joint embedding on |
+| Pose→Rot | rest 4 / pose 4 / memory 4 / decoder 8 (cross 6), `q_dim` 256, 8 heads |
+| Temporal | `seq_len` 32, sliding window 5 (self and cross attention) |
+| Optimisation | batch 2 per GPU, lr 1e-4, 60 epochs, no gradient accumulation |
+| Teacher forcing | `pose_source_mode: mix`, 0.1 → 1.0 linear over 20 epochs |
+| Loss | pose 1.0 (l2), rot 1.0 (smooth-l1), vel 1.0 (smooth-l1); pose-vel / acc / fk 0 |
+
+| | Setting A (released) | Setting B |
+| --- | --- | --- |
+| `ref_enhance` | `cross_seq` / `cross_angle` | off (`null`) |
+| `loss.root_wt` | 0.2 | 0.1 |
+| `loss.root_rot_v_wt` | 0.1 | 0.0 |
+| GPUs · reported epoch | 8 · 60 | 4 · 50 |
+
+There is a trade-off: Setting B scores better on the benchmark above, Setting A
+retargets better. Pick whichever fits your goal, and say which one you used when
+reporting numbers.
 
 ## License
 
