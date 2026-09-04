@@ -304,29 +304,19 @@ produced.
 
 ### ⚠️ These do not match the paper
 
-**The paper's Table 1 was computed on a different train/test split than the one released
-here.** The difference is concentrated on Zoo-Unseen — about 19.6° on the released split
-against 6.54° in the paper. The seen / rare / obj columns agree to within roughly 1 cm
-and 1–2°.
+The paper's Table 1 used a different train/test split. The gap is concentrated on
+Zoo-Unseen — ~19.6° here against 6.54° there; seen / rare / obj agree to within about
+1 cm and 1–2°. Compare on the split shipped in this repository.
 
-Unseen-species rotation error depends heavily on *which* species land in the unseen
-bucket, and the two splits partition them differently. The paper's observation that
-unseen error falls below seen error holds on its split, not on this one. If you are
-comparing against this work, please compare on the split you can actually download —
-the one in this repository.
+### Reference enhancement
 
-### Reference enhancement and retargeting
+`ref_enhance` draws the reference frame from elsewhere in the same species
+(`cross_seq`, animals) or a different yaw of the same sequence (`cross_angle`,
+objects). Training-time only — never used at evaluation.
 
-`ref_enhance` draws the reference frame from elsewhere in the same species (`cross_seq`,
-animals) or from a different yaw of the same sequence (`cross_angle`, objects). It is a
-training-time augmentation only and is never used at evaluation.
-
-There is a real trade-off. An otherwise identical run **without** it scores slightly
-better across all four benchmark columns above — so if you are chasing benchmark numbers,
-Setting B is the stronger choice. The released checkpoint nonetheless uses Setting A,
-because it produces visibly better **retargeting and in-the-wild results**, which is what
-the demo and most downstream use actually depends on. Train whichever matches your goal,
-and say which one you used when reporting numbers.
+Setting B scores slightly better on all four benchmark columns; Setting A gives
+better retargeting and in-the-wild results, which is why the released checkpoint
+uses it. Say which one you used when reporting numbers.
 
 ## License
 
