@@ -28,7 +28,8 @@
 - **[2026-07-13]** — 💃 Dance Anything tab: dance video (with music) → SAM2 picks the dancer → animal performs the dance with the original audio.
 - **[2026-07-15]** — 🌐 **[Live online demo on HuggingFace Spaces](https://huggingface.co/spaces/kehong/MoCapAnythingV2)** (ZeroGPU, free) — try it in the browser, no setup: interactive 3D pose + mesh, retargeting, and Dance Anything.
 - **[2026-07-15]** — 🖼️ Interactive 3D + shareable **input | skeleton | mesh** clip rendered without Blender (works on Spaces); SAM2 via `transformers`; textured meshes.
-- **[TODO]** — 📦 Full training datasets released on HuggingFace.
+- **[2026-09-04]** — 📦 **[Full training data on HuggingFace](https://huggingface.co/datasets/kehong/MoCapAnythingV2-data)** (`zoo1030` + `obj1k`, ~25 GB) — **gated**: get [Truebones Zoo](https://truebones.gumroad.com/l/skZMC) from Truebones yourself first (it's pay-what-you-want), then request access; approvals are manual. Per-frame DINOv2 features are not shipped — regenerate them with `preprocess/`.
+- **[2026-09-04]** — 📊 Released train/test splits now ship in the repo, and [RUN.md](RUN.md#metrics--reproduction) documents the reproduction commands, the expected metrics, and how they differ from the paper.
 
 <p align="center">
   <img src="assets/demo_app.png" width="92%" alt="MocapAnything V2 interactive demo — pick a video, pick a target species/object, run: pose skeleton + 3D mesh render, with retargeting and a Dance Anything tab" />
